@@ -41,6 +41,16 @@ typedef struct {
     ngx_queue_t queue;
     ngx_connection_t *peer_connection;
     ngx_connection_t *client_connection;
+    /*
+     * in_cache == 1  : item is in conf->cache and owns peer_connection.
+     * in_cache == 0  : item is in conf->free  (idle slot, no connection).
+     *
+     * This flag is the authoritative ownership indicator.  Every code path
+     * that moves an item out of conf->cache MUST set in_cache = 0 and NULL
+     * out peer_connection BEFORE doing anything else, so that a concurrently
+     * running cleanup or close handler can bail out early and safely.
+     */
+    unsigned in_cache:1;
 } ngx_http_upstream_ntlm_cache_t;
 
 typedef struct {
@@ -226,6 +236,15 @@ static ngx_int_t ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc,
 
         if (item->client_connection == hndp->client_connection) {
             c = item->peer_connection;
+
+            /*
+             * Clear ownership fields BEFORE touching the queues so that any
+             * handler that checks in_cache (close_handler, cleanup) sees the
+             * item as no longer active and does nothing.
+             */
+            item->in_cache = 0;
+            item->peer_connection = NULL;
+
             ngx_queue_remove(q);
             ngx_queue_insert_head(&hndp->conf->free, q);
             hndp->cached = 1;
@@ -301,12 +320,23 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
     }
 
     if (ngx_queue_empty(&hndp->conf->free)) {
+        ngx_connection_t *old_pc;
+
         q = ngx_queue_last(&hndp->conf->cache);
         ngx_queue_remove(q);
 
         item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
-        ngx_http_upstream_ntlm_close(item->peer_connection);
+
+        /*
+         * Evict the oldest cached entry.  Clear ownership before closing so
+         * that close_handler (if it fires for the evicted connection) finds
+         * in_cache == 0 and does nothing.
+         */
+        old_pc = item->peer_connection;
+        item->in_cache = 0;
         item->peer_connection = NULL;
+
+        ngx_http_upstream_ntlm_close(old_pc);
     } else {
         q = ngx_queue_head(&hndp->conf->free);
         ngx_queue_remove(q);
@@ -317,16 +347,23 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
 
     item->peer_connection = c;
     item->client_connection = hndp->client_connection;
+    item->in_cache = 1;
 
     ngx_log_debug2(
         NGX_LOG_DEBUG_HTTP, pc->log, 0,
         "ntlm free peer saving item client_connection %p, pear connection %p",
         item->client_connection, c);
 
-    // create the client connection drop down handler
+    /*
+     * Ensure the client connection has a cleanup handler that points to
+     * *this* item.  If a handler was already registered (e.g. from a
+     * previous request on the same keep-alive client connection), update
+     * its data pointer so it always refers to the current item.
+     */
     for (cln = item->client_connection->pool->cleanup; cln; cln = cln->next) {
         if (cln->handler == ngx_http_upstream_client_conn_cleanup) {
-            cleanup_item = cln->data;
+            cln->data = item;
+            cleanup_item = item;
             break;
         }
     }
@@ -353,6 +390,14 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
     c->write->handler = ngx_http_upstream_ntlm_dummy_handler;
     c->read->handler = ngx_http_upstream_ntlm_close_handler;
 
+    /*
+     * c->data stores the cache item while the connection is idle in the
+     * NTLM cache.  The close_handler validates in_cache and peer_connection
+     * before trusting this pointer, so it is safe.  NGINX core never reads
+     * c->data for idle connections (it only does so inside
+     * ngx_http_upstream_handler, which is not installed as the read/write
+     * handler for cached connections).
+     */
     c->data = item;
     c->idle = 1;
     c->log = ngx_cycle->log;
@@ -370,21 +415,47 @@ invalid:
 
 static void ngx_http_upstream_client_conn_cleanup(void *data) {
     ngx_http_upstream_ntlm_cache_t *item = data;
-    
+    ngx_connection_t               *c;
+
     ngx_log_debug2(
         NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-        "ntlm client connection closed %p, droping peer connection %p",
+        "ntlm client connection closed %p, dropping peer connection %p",
         item->client_connection, item->peer_connection);
 
-    // Check if the item was removed previously from the queue (backend drop)
-    if (item->peer_connection != NULL) {
-
-        item->peer_connection->read->timedout = 1;
-        ngx_post_event(item->peer_connection->read,&ngx_posted_events);
-
-        ngx_queue_remove(&item->queue);
-        ngx_queue_insert_head(&item->conf->free, &item->queue);
+    /*
+     * Only act if this item currently owns a cached upstream connection.
+     * in_cache == 0 means the connection was already consumed (reused by
+     * get_ntlm_peer) or closed (by close_handler / eviction).  In that
+     * case the cleanup is a no-op; attempting to touch peer_connection or
+     * the queue would corrupt state.
+     *
+     * Note: we must NOT post an event here.  A posted event fires
+     * asynchronously and by the time it runs the peer connection may have
+     * been reused for a new request, causing close_handler to close a
+     * live connection or corrupt the queue.  Close synchronously instead.
+     */
+    if (!item->in_cache) {
+        return;
     }
+
+    c = item->peer_connection;
+
+    /* Clear ownership before any queue or connection operations. */
+    item->in_cache = 0;
+    item->peer_connection = NULL;
+
+    ngx_queue_remove(&item->queue);
+    ngx_queue_insert_head(&item->conf->free, &item->queue);
+
+    if (c == NULL) {
+        return;
+    }
+
+    if (c->read->timer_set) {
+        ngx_del_timer(c->read);
+    }
+
+    ngx_http_upstream_ntlm_close(c);
 }
 
 static void ngx_http_upstream_ntlm_dummy_handler(ngx_event_t *ev) {
@@ -393,10 +464,10 @@ static void ngx_http_upstream_ntlm_dummy_handler(ngx_event_t *ev) {
 
 static void ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev) {
     ngx_http_upstream_ntlm_srv_conf_t *conf;
-    ngx_http_upstream_ntlm_cache_t *item;
+    ngx_http_upstream_ntlm_cache_t   *item;
 
-    int n;
-    char buf[1];
+    int               n;
+    char              buf[1];
     ngx_connection_t *c;
 
     c = ev->data;
@@ -419,16 +490,44 @@ static void ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev) {
 
 close:
 
+    /*
+     * c->data holds the cache item pointer only while the connection is
+     * idle in the NTLM cache (item->in_cache == 1 and
+     * item->peer_connection == c).
+     *
+     * Guard against two hazard scenarios:
+     *
+     *  1. The cleanup handler already reclaimed this connection
+     *     (set in_cache = 0 and peer_connection = NULL) before this
+     *     handler ran.  In that case c->data is still the old item
+     *     pointer, but touching the queue would corrupt state.
+     *
+     *  2. The item was evicted and reassigned to a different upstream
+     *     connection (peer_connection != c).  Closing or re-queuing
+     *     based on stale c->data would affect a live connection.
+     *
+     * Both cases are safely caught by the in_cache + peer_connection
+     * ownership check below.
+     */
+    item = c->data;
+
+    if (item == NULL || !item->in_cache || item->peer_connection != c) {
+        /* Connection is no longer ours; nothing to do. */
+        return;
+    }
+
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ev->log, 0,
                    "ntlm close peer connection %p, timeout %ui", c,
                    c->read->timedout);
 
-    item = c->data;
     conf = item->conf;
-   
-    // set the item peer connection to null to make sure we don't close it again
-    // when the client connection cleanup is triggered
+
+    /* Clear ownership before closing so the cleanup handler (if it fires
+     * for the associated client connection) finds in_cache == 0 and exits
+     * early, preventing any double-close or double-queue-remove. */
+    item->in_cache = 0;
     item->peer_connection = NULL;
+
     ngx_http_upstream_ntlm_close(c);
 
     ngx_queue_remove(&item->queue);
