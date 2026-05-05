@@ -50,7 +50,7 @@ typedef struct {
      * out peer_connection BEFORE doing anything else, so that a concurrently
      * running cleanup or close handler can bail out early and safely.
      */
-    unsigned in_cache:1;
+    unsigned in_cache : 1;
 } ngx_http_upstream_ntlm_cache_t;
 
 typedef struct {
@@ -415,7 +415,7 @@ invalid:
 
 static void ngx_http_upstream_client_conn_cleanup(void *data) {
     ngx_http_upstream_ntlm_cache_t *item = data;
-    ngx_connection_t               *c;
+    ngx_connection_t *c;
 
     ngx_log_debug2(
         NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
@@ -435,8 +435,14 @@ static void ngx_http_upstream_client_conn_cleanup(void *data) {
      * live connection or corrupt the queue.  Close synchronously instead.
      */
     if (!item->in_cache) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                       "ntlm client connection %p/%p already gone",
+                       item->client_connection, item->peer_connection);
         return;
     }
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                   "ntlm client connection %p/%p doing cleanup",
+                   item->client_connection, item->peer_connection);
 
     c = item->peer_connection;
 
@@ -464,10 +470,10 @@ static void ngx_http_upstream_ntlm_dummy_handler(ngx_event_t *ev) {
 
 static void ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev) {
     ngx_http_upstream_ntlm_srv_conf_t *conf;
-    ngx_http_upstream_ntlm_cache_t   *item;
+    ngx_http_upstream_ntlm_cache_t *item;
 
-    int               n;
-    char              buf[1];
+    int n;
+    char buf[1];
     ngx_connection_t *c;
 
     c = ev->data;
@@ -517,8 +523,8 @@ close:
     }
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ev->log, 0,
-                   "ntlm close peer connection %p, timeout %ui", c,
-                   c->read->timedout);
+                   "ntlm close peer connection %p, timeout %u, read %i", c,
+                   c->read->timedout, n);
 
     conf = item->conf;
 
