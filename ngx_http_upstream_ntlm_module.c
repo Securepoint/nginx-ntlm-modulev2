@@ -351,7 +351,7 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
 
     ngx_log_debug2(
         NGX_LOG_DEBUG_HTTP, pc->log, 0,
-        "ntlm free peer saving item client_connection %p, pear connection %p",
+        "ntlm free peer saving item client_connection %p, peer connection %p",
         item->client_connection, c);
 
     /*
