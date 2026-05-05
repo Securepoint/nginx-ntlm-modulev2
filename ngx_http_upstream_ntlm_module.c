@@ -522,7 +522,7 @@ close:
         return;
     }
 
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ev->log, 0,
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, ev->log, 0,
                    "ntlm close peer connection %p, timeout %u, read %i", c,
                    c->read->timedout, n);
 
