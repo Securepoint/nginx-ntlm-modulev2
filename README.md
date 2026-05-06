@@ -36,6 +36,18 @@ The connections parameter sets the maximum number of connections to the upstream
 
 Sets the timeout during which an idle connection to an upstream server will stay open.
 
+> Syntax:  ntlm_time time;  
+> Default: ntlm_time 1h;  
+> Context: upstream  
+
+Sets the maximum wall-clock age of a cached upstream connection. Once the connection has been open for longer than this value it will not be reused, even if it is otherwise idle and healthy. This bounds the lifetime of a single NTLM authentication context.
+
+> Syntax:  ntlm_requests number;  
+> Default: ntlm_requests 1000;  
+> Context: upstream  
+
+Sets the maximum number of requests that may be made over a single cached upstream connection before it is closed and a new one is established. Limiting the number of requests per connection prevents a single long-lived connection from accumulating unbounded state.
+
 ## Build 
 
 Follow the instructions from [Building nginx from Sources](http://nginx.org/en/docs/configure.html) and add the following line to the configure command
@@ -69,6 +81,14 @@ export PATH=/opt/local/nginx/sbin:$PATH
 prove -r t
 ```
 
+
+## nginx Version Compatibility
+
+| nginx version | Notes |
+|---------------|-------|
+| < 1.9.1       | Not supported — the upstream peer API used by this module was introduced in nginx 1.9.1. |
+| 1.9.1 – 1.24.x | Supported. |
+| ≥ 1.25.x      | Supported. Versions in the 1.25/1.26/1.27/1.28 series (e.g. 1.28.3) changed internal assumptions about `ngx_connection_t->data` in the upstream event handler (`ngx_http_upstream_handler` now expects `c->data` to hold the request pointer). Earlier releases of this module reused `c->data` to store the NTLM cache item on idle connections, which caused segfaults with these nginx versions. This was fixed in the module — see [PR #4](https://github.com/Securepoint/nginx-ntlm-module/pull/4). Use a module build from the current `main` branch when running nginx ≥ 1.25. |
 
 ## Acknowledgments
 
