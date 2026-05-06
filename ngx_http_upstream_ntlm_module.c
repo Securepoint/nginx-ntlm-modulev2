@@ -31,7 +31,7 @@ static void ngx_http_upstream_client_conn_cleanup(void *data);
 
 typedef struct {
     ngx_uint_t max_cached;
-    ngx_uint_t requests;
+    ngx_uint_t max_requests;
     ngx_msec_t time;
     ngx_msec_t timeout;
     ngx_queue_t free;
@@ -89,7 +89,7 @@ static ngx_command_t ngx_http_upstream_ntlm_commands[] = {
 
     {ngx_string("ntlm_requests"), NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1,
      ngx_conf_set_num_slot, NGX_HTTP_SRV_CONF_OFFSET,
-     offsetof(ngx_http_upstream_ntlm_srv_conf_t, requests), NULL},
+     offsetof(ngx_http_upstream_ntlm_srv_conf_t, max_requests), NULL},
 
     ngx_null_command /* command termination */
 };
@@ -136,7 +136,7 @@ static ngx_int_t ngx_http_upstream_init_ntlm(ngx_conf_t *cf,
 
     ngx_conf_init_uint_value(hncf->max_cached, 100);
     ngx_conf_init_msec_value(hncf->timeout, 60000);
-    ngx_conf_init_uint_value(hncf->requests, 1000);
+    ngx_conf_init_uint_value(hncf->max_requests, 1000);
     ngx_conf_init_msec_value(hncf->time, 3600000);
 
     if (hncf->original_init_upstream(cf, us) != NGX_OK) {
@@ -282,7 +282,6 @@ found:
 
     c->idle = 0;
     c->sent = 0;
-    c->data = NULL;
     /*
      * Restore c->read->data to the connection pointer.  While cached,
      * c->read->data held the ntlm cache item (see ngx_http_upstream_free_ntlm_peer).
@@ -290,6 +289,7 @@ found:
      * reset this before handing the connection back to upstream.
      */
     c->read->data = c;
+    c->data = NULL;
     c->log = pc->log;
     c->read->log = pc->log;
     c->write->log = pc->log;
@@ -343,7 +343,7 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
         goto invalid;
     }
 
-    if (c->requests >= hndp->conf->requests) {
+    if (c->requests >= hndp->conf->max_requests) {
         goto invalid;
     }
 
@@ -655,7 +655,7 @@ static void *ngx_http_upstream_ntlm_create_conf(ngx_conf_t *cf) {
     }
 
     conf->max_cached = NGX_CONF_UNSET_UINT;
-    conf->requests = NGX_CONF_UNSET_UINT;
+    conf->max_requests = NGX_CONF_UNSET_UINT;
     conf->time = NGX_CONF_UNSET_MSEC;
     conf->timeout = NGX_CONF_UNSET_MSEC;
 
