@@ -13,6 +13,8 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
 static void ngx_http_upstream_ntlm_dummy_handler(ngx_event_t *ev);
 static void ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev);
 static void ngx_http_upstream_ntlm_close(ngx_connection_t *c);
+static void ngx_http_upstream_ntlm_notify_peer(ngx_peer_connection_t *pc,
+                                               void *data, ngx_uint_t type);
 
 #if (NGX_HTTP_SSL)
 static ngx_int_t ngx_http_upstream_ntlm_set_session(ngx_peer_connection_t *pc,
@@ -29,6 +31,8 @@ static void ngx_http_upstream_client_conn_cleanup(void *data);
 
 typedef struct {
     ngx_uint_t max_cached;
+    ngx_uint_t requests;
+    ngx_msec_t time;
     ngx_msec_t timeout;
     ngx_queue_t free;
     ngx_queue_t cache;
@@ -62,6 +66,7 @@ typedef struct {
     unsigned ntlm_init : 1;
     ngx_event_get_peer_pt original_get_peer;
     ngx_event_free_peer_pt original_free_peer;
+    ngx_event_notify_peer_pt original_notify;
 #if (NGX_HTTP_SSL)
     ngx_event_set_peer_session_pt original_set_session;
     ngx_event_save_peer_session_pt original_save_session;
@@ -77,6 +82,14 @@ static ngx_command_t ngx_http_upstream_ntlm_commands[] = {
     {ngx_string("ntlm_timeout"), NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1,
      ngx_conf_set_msec_slot, NGX_HTTP_SRV_CONF_OFFSET,
      offsetof(ngx_http_upstream_ntlm_srv_conf_t, timeout), NULL},
+
+    {ngx_string("ntlm_time"), NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1,
+     ngx_conf_set_msec_slot, NGX_HTTP_SRV_CONF_OFFSET,
+     offsetof(ngx_http_upstream_ntlm_srv_conf_t, time), NULL},
+
+    {ngx_string("ntlm_requests"), NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1,
+     ngx_conf_set_num_slot, NGX_HTTP_SRV_CONF_OFFSET,
+     offsetof(ngx_http_upstream_ntlm_srv_conf_t, requests), NULL},
 
     ngx_null_command /* command termination */
 };
@@ -123,6 +136,8 @@ static ngx_int_t ngx_http_upstream_init_ntlm(ngx_conf_t *cf,
 
     ngx_conf_init_uint_value(hncf->max_cached, 100);
     ngx_conf_init_msec_value(hncf->timeout, 60000);
+    ngx_conf_init_uint_value(hncf->requests, 1000);
+    ngx_conf_init_msec_value(hncf->time, 3600000);
 
     if (hncf->original_init_upstream(cf, us) != NGX_OK) {
         return NGX_ERROR;
@@ -197,6 +212,12 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
     r->upstream->peer.data = hnpd;
     r->upstream->peer.get = ngx_http_upstream_get_ntlm_peer;
     r->upstream->peer.free = ngx_http_upstream_free_ntlm_peer;
+
+    hnpd->original_notify = NULL;
+    if (r->upstream->peer.notify) {
+        hnpd->original_notify = r->upstream->peer.notify;
+        r->upstream->peer.notify = ngx_http_upstream_ntlm_notify_peer;
+    }
 
 #if (NGX_HTTP_SSL)
     hnpd->original_set_session = r->upstream->peer.set_session;
@@ -322,6 +343,14 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
         goto invalid;
     }
 
+    if (c->requests >= hndp->conf->requests) {
+        goto invalid;
+    }
+
+    if (ngx_current_msec - c->start_time > hndp->conf->time) {
+        goto invalid;
+    }
+
     if (hndp->ntlm_init == 0 && hndp->cached == 0) {
         goto invalid;
     }
@@ -343,7 +372,9 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
         item->in_cache = 0;
         item->peer_connection = NULL;
 
-        ngx_http_upstream_ntlm_close(old_pc);
+        if (old_pc != NULL) {
+            ngx_http_upstream_ntlm_close(old_pc);
+        }
     } else {
         q = ngx_queue_head(&hndp->conf->free);
         ngx_queue_remove(q);
@@ -410,6 +441,7 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
      * to upstream core (see ngx_http_upstream_get_ntlm_peer).
      */
     c->read->data = item;
+    c->data = NULL;
     c->idle = 1;
     c->log = ngx_cycle->log;
     c->read->log = ngx_cycle->log;
@@ -477,6 +509,15 @@ static void ngx_http_upstream_client_conn_cleanup(void *data) {
 
 static void ngx_http_upstream_ntlm_dummy_handler(ngx_event_t *ev) {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ev->log, 0, "ntlm dummy handler");
+}
+
+static void ngx_http_upstream_ntlm_notify_peer(ngx_peer_connection_t *pc,
+                                               void *data, ngx_uint_t type) {
+    ngx_http_upstream_ntlm_peer_data_t *hndp = data;
+
+    if (hndp->original_notify) {
+        hndp->original_notify(pc, hndp->data, type);
+    }
 }
 
 static void ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev) {
@@ -614,6 +655,8 @@ static void *ngx_http_upstream_ntlm_create_conf(ngx_conf_t *cf) {
     }
 
     conf->max_cached = NGX_CONF_UNSET_UINT;
+    conf->requests = NGX_CONF_UNSET_UINT;
+    conf->time = NGX_CONF_UNSET_MSEC;
     conf->timeout = NGX_CONF_UNSET_MSEC;
 
     return conf;
