@@ -13,6 +13,8 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
 static void ngx_http_upstream_ntlm_dummy_handler(ngx_event_t *ev);
 static void ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev);
 static void ngx_http_upstream_ntlm_close(ngx_connection_t *c);
+static void ngx_http_upstream_ntlm_notify_peer(ngx_peer_connection_t *pc,
+                                               void *data, ngx_uint_t type);
 
 #if (NGX_HTTP_SSL)
 static ngx_int_t ngx_http_upstream_ntlm_set_session(ngx_peer_connection_t *pc,
@@ -29,6 +31,8 @@ static void ngx_http_upstream_client_conn_cleanup(void *data);
 
 typedef struct {
     ngx_uint_t max_cached;
+    ngx_uint_t max_requests;
+    ngx_msec_t time;
     ngx_msec_t timeout;
     ngx_queue_t free;
     ngx_queue_t cache;
@@ -62,6 +66,7 @@ typedef struct {
     unsigned ntlm_init : 1;
     ngx_event_get_peer_pt original_get_peer;
     ngx_event_free_peer_pt original_free_peer;
+    ngx_event_notify_peer_pt original_notify;
 #if (NGX_HTTP_SSL)
     ngx_event_set_peer_session_pt original_set_session;
     ngx_event_save_peer_session_pt original_save_session;
@@ -77,6 +82,14 @@ static ngx_command_t ngx_http_upstream_ntlm_commands[] = {
     {ngx_string("ntlm_timeout"), NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1,
      ngx_conf_set_msec_slot, NGX_HTTP_SRV_CONF_OFFSET,
      offsetof(ngx_http_upstream_ntlm_srv_conf_t, timeout), NULL},
+
+    {ngx_string("ntlm_time"), NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1,
+     ngx_conf_set_msec_slot, NGX_HTTP_SRV_CONF_OFFSET,
+     offsetof(ngx_http_upstream_ntlm_srv_conf_t, time), NULL},
+
+    {ngx_string("ntlm_requests"), NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1,
+     ngx_conf_set_num_slot, NGX_HTTP_SRV_CONF_OFFSET,
+     offsetof(ngx_http_upstream_ntlm_srv_conf_t, max_requests), NULL},
 
     ngx_null_command /* command termination */
 };
@@ -123,6 +136,8 @@ static ngx_int_t ngx_http_upstream_init_ntlm(ngx_conf_t *cf,
 
     ngx_conf_init_uint_value(hncf->max_cached, 100);
     ngx_conf_init_msec_value(hncf->timeout, 60000);
+    ngx_conf_init_uint_value(hncf->max_requests, 1000);
+    ngx_conf_init_msec_value(hncf->time, 3600000);
 
     if (hncf->original_init_upstream(cf, us) != NGX_OK) {
         return NGX_ERROR;
@@ -198,6 +213,12 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
     r->upstream->peer.get = ngx_http_upstream_get_ntlm_peer;
     r->upstream->peer.free = ngx_http_upstream_free_ntlm_peer;
 
+    hnpd->original_notify = NULL;
+    if (r->upstream->peer.notify) {
+        hnpd->original_notify = r->upstream->peer.notify;
+        r->upstream->peer.notify = ngx_http_upstream_ntlm_notify_peer;
+    }
+
 #if (NGX_HTTP_SSL)
     hnpd->original_set_session = r->upstream->peer.set_session;
     hnpd->original_save_session = r->upstream->peer.save_session;
@@ -261,6 +282,13 @@ found:
 
     c->idle = 0;
     c->sent = 0;
+    /*
+     * Restore c->read->data to the connection pointer.  While cached,
+     * c->read->data held the ntlm cache item (see ngx_http_upstream_free_ntlm_peer).
+     * nginx upstream core expects ev->data == c (the connection), so we must
+     * reset this before handing the connection back to upstream.
+     */
+    c->read->data = c;
     c->data = NULL;
     c->log = pc->log;
     c->read->log = pc->log;
@@ -315,6 +343,14 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
         goto invalid;
     }
 
+    if (c->requests >= hndp->conf->max_requests) {
+        goto invalid;
+    }
+
+    if (ngx_current_msec - c->start_time > hndp->conf->time) {
+        goto invalid;
+    }
+
     if (hndp->ntlm_init == 0 && hndp->cached == 0) {
         goto invalid;
     }
@@ -336,7 +372,9 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
         item->in_cache = 0;
         item->peer_connection = NULL;
 
-        ngx_http_upstream_ntlm_close(old_pc);
+        if (old_pc != NULL) {
+            ngx_http_upstream_ntlm_close(old_pc);
+        }
     } else {
         q = ngx_queue_head(&hndp->conf->free);
         ngx_queue_remove(q);
@@ -391,14 +429,19 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
     c->read->handler = ngx_http_upstream_ntlm_close_handler;
 
     /*
-     * c->data stores the cache item while the connection is idle in the
-     * NTLM cache.  The close_handler validates in_cache and peer_connection
-     * before trusting this pointer, so it is safe.  NGINX core never reads
-     * c->data for idle connections (it only does so inside
-     * ngx_http_upstream_handler, which is not installed as the read/write
-     * handler for cached connections).
+     * Store the cache item in c->read->data (the read event's data field)
+     * rather than in c->data.  nginx's ngx_http_upstream_handler() assumes
+     * c->data is ngx_http_request_t*, so overwriting it with an ntlm cache
+     * item pointer causes a segfault if any posted or ready event reaches
+     * that handler while the connection is idle.  Since we have replaced
+     * c->read->handler with our own ngx_http_upstream_ntlm_close_handler,
+     * only our handler runs on read events for this connection; it retrieves
+     * the item via ev->data (= c->read->data) without touching c->data at
+     * all.  c->read->data is restored to c before the connection is returned
+     * to upstream core (see ngx_http_upstream_get_ntlm_peer).
      */
-    c->data = item;
+    c->read->data = item;
+    c->data = NULL;
     c->idle = 1;
     c->log = ngx_cycle->log;
     c->read->log = ngx_cycle->log;
@@ -468,6 +511,15 @@ static void ngx_http_upstream_ntlm_dummy_handler(ngx_event_t *ev) {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ev->log, 0, "ntlm dummy handler");
 }
 
+static void ngx_http_upstream_ntlm_notify_peer(ngx_peer_connection_t *pc,
+                                               void *data, ngx_uint_t type) {
+    ngx_http_upstream_ntlm_peer_data_t *hndp = data;
+
+    if (hndp->original_notify) {
+        hndp->original_notify(pc, hndp->data, type);
+    }
+}
+
 static void ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev) {
     ngx_http_upstream_ntlm_srv_conf_t *conf;
     ngx_http_upstream_ntlm_cache_t *item;
@@ -476,7 +528,34 @@ static void ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev) {
     char buf[1];
     ngx_connection_t *c;
 
-    c = ev->data;
+    /*
+     * While a connection is idle in the NTLM cache its read event's data
+     * field (c->read->data, i.e. ev->data here) holds a pointer to the
+     * owning ngx_http_upstream_ntlm_cache_t item.  We retrieve the item
+     * directly from ev->data rather than from c->data, because c->data must
+     * be left alone: nginx's ngx_http_upstream_handler() assumes c->data is
+     * ngx_http_request_t* and will segfault if it finds our cache item there
+     * via any posted or ready event.
+     */
+    item = ev->data;
+
+    /*
+     * item should never be NULL here because we always set c->read->data =
+     * item before installing this handler, and c->read->data is restored to
+     * c only after the handler is replaced.  The NULL guard is a belt-and-
+     * suspenders safety check.
+     */
+    if (item == NULL || !item->in_cache) {
+        /* Already reclaimed by cleanup or eviction; nothing to do. */
+        return;
+    }
+
+    c = item->peer_connection;
+
+    if (c == NULL) {
+        /* Ownership was cleared; nothing to do. */
+        return;
+    }
 
     if (c->close || c->read->timedout) {
         goto close;
@@ -497,27 +576,13 @@ static void ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev) {
 close:
 
     /*
-     * c->data holds the cache item pointer only while the connection is
-     * idle in the NTLM cache (item->in_cache == 1 and
-     * item->peer_connection == c).
-     *
-     * Guard against two hazard scenarios:
-     *
-     *  1. The cleanup handler already reclaimed this connection
-     *     (set in_cache = 0 and peer_connection = NULL) before this
-     *     handler ran.  In that case c->data is still the old item
-     *     pointer, but touching the queue would corrupt state.
-     *
-     *  2. The item was evicted and reassigned to a different upstream
-     *     connection (peer_connection != c).  Closing or re-queuing
-     *     based on stale c->data would affect a live connection.
-     *
-     * Both cases are safely caught by the in_cache + peer_connection
-     * ownership check below.
+     * Belt-and-suspenders guard for the close: path.  Although the early
+     * checks above already verified in_cache and peer_connection before any
+     * blocking/yield point, this second check ensures correctness if, due to
+     * a hypothetical future code change, the close: label is reached by a
+     * path that did not pass the early guards.
      */
-    item = c->data;
-
-    if (item == NULL || !item->in_cache || item->peer_connection != c) {
+    if (!item->in_cache || item->peer_connection != c) {
         /* Connection is no longer ours; nothing to do. */
         return;
     }
@@ -590,6 +655,8 @@ static void *ngx_http_upstream_ntlm_create_conf(ngx_conf_t *cf) {
     }
 
     conf->max_cached = NGX_CONF_UNSET_UINT;
+    conf->max_requests = NGX_CONF_UNSET_UINT;
+    conf->time = NGX_CONF_UNSET_MSEC;
     conf->timeout = NGX_CONF_UNSET_MSEC;
 
     return conf;
