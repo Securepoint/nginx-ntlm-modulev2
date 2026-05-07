@@ -30,4 +30,4 @@ cd nginx-1.19.3/
             --with-http_ssl_module \
             --with-mail_ssl_module \
             --with-stream_ssl_module \
-            --add-module=../nginx-ntlm-module
+            --add-module=../nginx-ntlm-modulev2

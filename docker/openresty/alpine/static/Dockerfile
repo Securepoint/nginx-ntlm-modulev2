@@ -140,7 +140,7 @@ RUN apk add --no-cache --virtual .build-deps \
     && curl -fSL https://openresty.org/download/openresty-${RESTY_VERSION}.tar.gz -o openresty-${RESTY_VERSION}.tar.gz \
     && tar xzf openresty-${RESTY_VERSION}.tar.gz \
     # clone the ntlm v2 repository  
-    && git clone https://github.com/Securepoint/nginx-ntlm-module.git nginx-ntlm-modulev2 \ 
+    && git clone https://github.com/Securepoint/nginx-ntlm-modulev2.git nginx-ntlm-modulev2 \ 
     # end
     && cd /tmp/openresty-${RESTY_VERSION} \
     && eval ./configure -j${RESTY_J} ${_RESTY_CONFIG_DEPS} ${RESTY_CONFIG_OPTIONS} ${RESTY_CONFIG_OPTIONS_MORE} ${RESTY_LUAJIT_OPTIONS} \
