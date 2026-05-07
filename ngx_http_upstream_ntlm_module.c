@@ -376,17 +376,11 @@ ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data)
         }
 
         /*
-         * Reuse the cached connection.  Clear ownership fields atomically
-         * (invariant I1) before any queue manipulation so that a concurrently
-         * running close_handler or cleanup handler sees in_cache == 0 and
-         * exits without touching the item.
+         * Reuse the cached connection.  Release through the canonical helper
+         * so ownership fields and queue movement stay atomic and consistent
+         * (invariant I1).
          */
-        item->in_cache = 0;
-        item->peer_connection = NULL;
-        item->client_connection = NULL;
-
-        ngx_queue_remove(q);
-        ngx_queue_insert_head(&hndp->conf->free, q);
+        ngx_http_upstream_ntlm_item_release(item);
 
         hndp->cached = 1;
         goto found;
@@ -502,22 +496,19 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
         ngx_connection_t *old_c;
 
         /*
-         * Cache is full.  Evict the oldest (tail) entry and reuse its slot.
-         * We must NOT use item_release() here because item_release() moves the
-         * slot to conf->free; we want to grab that same slot immediately for the
-         * new connection without a round-trip through the free list.
+         * Cache is full.  Evict the oldest (tail) entry through the canonical
+         * release path, then reuse the resulting free slot.
          */
         q    = ngx_queue_last(&hndp->conf->cache);
         item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
 
         old_c = item->peer_connection;
 
-        /* Clear ownership fields (invariant I1) before closing. */
-        item->in_cache          = 0;
-        item->peer_connection   = NULL;
-        item->client_connection = NULL;
+        ngx_http_upstream_ntlm_item_release(item);
 
-        ngx_queue_remove(q);   /* q is now unlinked; will be reused below */
+        q    = ngx_queue_head(&hndp->conf->free);
+        item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
+        ngx_queue_remove(q);
 
         if (old_c != NULL) {
             ngx_http_upstream_ntlm_close(old_c);
