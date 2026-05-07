@@ -48,7 +48,7 @@ ARG RESTY_CONFIG_OPTIONS="\
     --with-stream \
     --with-stream_ssl_module \
     --with-threads \
-    --add-module=../nginx-ntlm-module \
+    --add-module=../nginx-ntlm-modulev2 \
     "
 ARG RESTY_CONFIG_OPTIONS_MORE=""
 ARG RESTY_LUAJIT_OPTIONS="--with-luajit-xcflags='-DLUAJIT_NUMMODE=2 -DLUAJIT_ENABLE_LUA52COMPAT'"
@@ -139,8 +139,8 @@ RUN apk add --no-cache --virtual .build-deps \
     && cd /tmp \
     && curl -fSL https://openresty.org/download/openresty-${RESTY_VERSION}.tar.gz -o openresty-${RESTY_VERSION}.tar.gz \
     && tar xzf openresty-${RESTY_VERSION}.tar.gz \
-    # clone the ntlm repository  
-    && git clone https://github.com/gabihodoroaga/nginx-ntlm-module.git \ 
+    # clone the ntlm v2 repository  
+    && git clone https://github.com/Securepoint/nginx-ntlm-module.git nginx-ntlm-modulev2 \ 
     # end
     && cd /tmp/openresty-${RESTY_VERSION} \
     && eval ./configure -j${RESTY_J} ${_RESTY_CONFIG_DEPS} ${RESTY_CONFIG_OPTIONS} ${RESTY_CONFIG_OPTIONS_MORE} ${RESTY_LUAJIT_OPTIONS} \

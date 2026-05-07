@@ -1,8 +1,8 @@
-FROM alpine:3.13 AS builder
+FROM alpine:3.20 AS builder
 
-ARG NGINX_VERSION=1.19.3
+ARG NGINX_VERSION=1.28.0
 
-# install buidl tools
+# install build tools
 RUN set -x \
     && addgroup -g 101 -S nginx \
     && adduser -S -D -H -u 101 -h /var/cache/nginx -s /sbin/nologin -G nginx -g nginx nginx \
@@ -11,12 +11,11 @@ RUN set -x \
     libc-dev \
     make \
     openssl-dev \
-    pcre-dev \
+    pcre2-dev \
     zlib-dev \
     linux-headers \
     libxslt-dev \
     gd-dev \
-    geoip-dev \
     perl-dev \
     libedit-dev \
     curl \
@@ -27,7 +26,7 @@ WORKDIR /build
 # download nginx 
 RUN curl -OL http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
     && tar -xvzf nginx-${NGINX_VERSION}.tar.gz && rm nginx-${NGINX_VERSION}.tar.gz \
-    && git clone https://github.com/gabihodoroaga/nginx-ntlm-module.git
+    && git clone https://github.com/Securepoint/nginx-ntlm-module.git nginx-ntlm-modulev2
 
 RUN cd nginx-${NGINX_VERSION}/ \
     && ./configure \
@@ -38,7 +37,7 @@ RUN cd nginx-${NGINX_VERSION}/ \
         --error-log-path=/var/log/nginx/error.log \
         --http-log-path=/var/log/nginx/access.log \
         --pid-path=/var/run/nginx.pid \
-        --lock-path=/var/run/nginx.lock \ 
+        --lock-path=/var/run/nginx.lock \
         --http-client-body-temp-path=/var/cache/nginx/client_temp \
         --http-proxy-temp-path=/var/cache/nginx/proxy_temp \
         --http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp \
@@ -48,7 +47,7 @@ RUN cd nginx-${NGINX_VERSION}/ \
         --user=nginx \
         --group=nginx \
         --with-compat \
-        --with-file-aio \ 
+        --with-file-aio \
         --with-threads \
         --with-http_addition_module \
         --with-http_auth_request_module \
@@ -73,11 +72,11 @@ RUN cd nginx-${NGINX_VERSION}/ \
         --with-stream_ssl_preread_module \
         --with-cc-opt='-Os -fomit-frame-pointer' \
         --with-ld-opt=-Wl,--as-needed \
-        # add the ntlm module
-        --add-dynamic-module=../nginx-ntlm-module \
+        # add the ntlm v2 module as a dynamic module
+        --add-dynamic-module=../nginx-ntlm-modulev2 \
     && make modules
 
-FROM nginx:1.19.3-alpine
+FROM nginx:1.28.0-alpine
 
 COPY --from=builder /build/nginx-${NGINX_VERSION}/objs/ngx_http_upstream_ntlm_module.so /etc/nginx/modules/ngx_http_upstream_ntlm_module.so
 
