@@ -44,7 +44,7 @@ server {
 ```
 
 The connections parameter sets the maximum number of connections to the upstream servers that are preserved in the cache.
-If you configure explicit upstream keepalive, declare `keepalive` **before** `ntlm` in the same `upstream` block.
+If you configure explicit upstream keepalive, declare `keepalive` **before** `ntlm` in the same `upstream` block so the NTLM wrapper stays outermost and preserves authenticated connection pinning.
 
 > Syntax:  ntlm_timeout timeout;  
 > Default: ntlm_timeout 60s;  
