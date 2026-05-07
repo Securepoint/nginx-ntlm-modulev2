@@ -131,7 +131,7 @@ nginx version.
 ## Acknowledgments
 
 - This module is based on the original nginx-ntlm-module by Gabriel Hodoroaga.
-- DO NOT USE THIS IN PRODUCTION. [**Nginx Plus**](https://www.nginx.com/products/nginx/) has support for NTLM. 
+- This module is community-maintained. For enterprise environments requiring vendor support or SLA guarantees, consider [**Nginx Plus**](https://www.nginx.com/products/nginx/), which has built-in NTLM support.
 
 ## Authors 
 
