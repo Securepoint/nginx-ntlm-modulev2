@@ -77,6 +77,7 @@ static void ngx_http_upstream_ntlm_save_session(ngx_peer_connection_t *pc,
 #endif
 
 static void *ngx_http_upstream_ntlm_create_conf(ngx_conf_t *cf);
+static char *ngx_http_upstream_ntlm_init_main_conf(ngx_conf_t *cf, void *conf);
 static char *ngx_http_upstream_ntlm_directive(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static void ngx_http_upstream_client_conn_cleanup(void *data);
@@ -161,7 +162,7 @@ static ngx_http_module_t ngx_http_upstream_ntlm_ctx = {
     NULL,                                   /* preconfiguration */
     NULL,                                   /* postconfiguration */
     NULL,                                   /* create main configuration */
-    NULL,                                   /* init main configuration */
+    ngx_http_upstream_ntlm_init_main_conf,  /* init main configuration */
     ngx_http_upstream_ntlm_create_conf,     /* create server configuration */
     NULL,                                   /* merge server configuration */
     NULL,                                   /* create location configuration */
@@ -225,8 +226,13 @@ ngx_http_upstream_init_ntlm(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
         return NGX_ERROR;
     }
 
-    hncf->original_init_peer = us->peer.init;
-    us->peer.init = ngx_http_upstream_init_ntlm_peer;
+    /*
+     * Do not wrap us->peer.init here.  Wrapping is deferred to
+     * ngx_http_upstream_ntlm_init_main_conf so that the NTLM layer is always
+     * installed after any peer wrappers that other modules inject in their own
+     * init_main_conf hooks (e.g. nginx master's automatic keepalive injection),
+     * keeping NTLM as the outermost wrapper regardless of nginx version.
+     */
 
     cached = ngx_pcalloc(cf->pool,
                          sizeof(ngx_http_upstream_ntlm_cache_t)
@@ -610,7 +616,12 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
         ngx_http_upstream_ntlm_close_handler(c->read);
     }
 
-    /* Return without calling the original free_peer; we own the connection. */
+    /*
+     * Call original_free_peer to release round-robin (and any other lower
+     * layer) accounting — e.g. decrementing the round-robin peer's conns
+     * counter.  pc->connection is already NULL so keepalive's free_peer
+     * (if present) will skip its own caching and delegate to round-robin.
+     */
     hndp->original_free_peer(pc, hndp->data, state);
     return;
 
@@ -806,6 +817,60 @@ ngx_http_upstream_ntlm_save_session(ngx_peer_connection_t *pc, void *data)
 #endif
 
 /* ── Configuration ───────────────────────────────────────────────────────── */
+
+/*
+ * ngx_http_upstream_ntlm_init_main_conf — install the NTLM peer wrapper.
+ *
+ * Runs during nginx's init_main_conf phase, which executes all HTTP module
+ * init_main_conf hooks in ascending module-index order.  Built-in modules
+ * (including ngx_http_upstream_keepalive_module) have lower indices than
+ * --add-module extensions, so this hook always runs AFTER the keepalive
+ * module has had a chance to inject its own peer wrapper.
+ *
+ * nginx master introduced automatic keepalive injection in keepalive's
+ * init_main_conf.  If NTLM wrapped peer.init during init_upstream (as it did
+ * before this fix), the keepalive wrapper would sit on the outside, stealing
+ * connections before NTLM could pin them and breaking NTLM session stickiness.
+ * Moving the wrapping here guarantees NTLM is always the outermost layer.
+ */
+static char *
+ngx_http_upstream_ntlm_init_main_conf(ngx_conf_t *cf, void *conf)
+{
+    ngx_uint_t                           i;
+    ngx_http_upstream_main_conf_t       *umcf;
+    ngx_http_upstream_srv_conf_t       **uscfp;
+    ngx_http_upstream_ntlm_srv_conf_t   *hncf;
+
+    umcf  = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_module);
+    uscfp = umcf->upstreams.elts;
+
+    for (i = 0; i < umcf->upstreams.nelts; i++) {
+
+        /* skip implicit upstreams (no server-conf block) */
+        if (uscfp[i]->srv_conf == NULL) {
+            continue;
+        }
+
+        hncf = ngx_http_conf_upstream_srv_conf(uscfp[i],
+                                               ngx_http_upstream_ntlm_module);
+
+        /* skip upstreams that don't have the ntlm directive */
+        if (hncf->original_init_upstream == NULL) {
+            continue;
+        }
+
+        /*
+         * At this point uscfp[i]->peer.init points to whatever the last
+         * init_main_conf hook installed (round-robin, keepalive wrapper, etc.).
+         * Save it as our original and replace it with the NTLM wrapper.
+         */
+        hncf->original_init_peer = uscfp[i]->peer.init;
+        uscfp[i]->peer.init      = ngx_http_upstream_init_ntlm_peer;
+    }
+
+    return NGX_CONF_OK;
+}
+
 
 static void *
 ngx_http_upstream_ntlm_create_conf(ngx_conf_t *cf)

@@ -50,7 +50,7 @@ header
 --- response_headers eval
 ["X-NGX-NTLM-AUTH: " . $::random_token, "X-NGX-NTLM-AUTH: " . $::random_token, "X-NGX-NTLM-AUTH: " . $::random_token]
 --- no_error_log
-[error]
+\[error\]
 
 
 === TEST 2: Negotiate header should trigger keepalive for upstream
@@ -78,7 +78,7 @@ header
 --- response_headers eval
 ["X-NGX-NTLM-AUTH: " . $::random_token, "X-NGX-NTLM-AUTH: " . $::random_token, "X-NGX-NTLM-AUTH: " . $::random_token]
 --- no_error_log
-[error]
+\[error\]
 
 
 === TEST 3: The backend connection should die when client connection dies
@@ -108,7 +108,7 @@ also
 --- raw_response_headers_unlike eval
 ["========","X-NGX-NTLM-AUTH: ","X-NGX-NTLM-AUTH: "]
 --- no_error_log
-[error]
+\[error\]
 
 
 === TEST 4: The backend connection should die when client connection dies
@@ -138,7 +138,7 @@ also
 --- raw_response_headers_unlike eval
 ["========","X-NGX-NTLM-AUTH: ","X-NGX-NTLM-AUTH: "]
 --- no_error_log
-[error]
+\[error\]
 
 
 === TEST 5: New NTLM credentials on an established connection must evict the old session
@@ -168,9 +168,10 @@ credentials are negotiated independently.
 --- response_headers eval
 ["X-NGX-NTLM-AUTH: " . $::random_token, "X-NGX-NTLM-AUTH: " . $::random_token, "X-NGX-NTLM-AUTH: " . $::random_token2]
 --- no_error_log
-[error]
+\[error\]
 
 
+=== TEST 6: OOM in cleanup handler must not cache the upstream connection
 # ── TEST 6: OOM in cleanup handler must not cache the upstream connection ──
 #
 # To run this test you need a build with the fault-injection flag enabled:
@@ -184,7 +185,6 @@ credentials are negotiated independently.
 # guard the module would cache the connection with a stale client_connection
 # pointer, enabling a session-hijack via pointer reuse (ABA attack).
 #
-=== TEST 6: OOM in cleanup handler must not cache the upstream connection
 When ngx_pool_cleanup_add returns NULL the upstream session MUST NOT be
 inserted into the cache.  A subsequent request on the same client connection
 must therefore NOT inherit the old authenticated upstream session.

@@ -53,7 +53,7 @@ should be handled properly (crashed the server before)
 --- raw_response_headers_unlike eval
 ["========","X-NGX-NTLM-AUTH: "]
 --- no_error_log
-[error]
+\[error\]
 
 
 === TEST 2: Handle client request after backend timeout
@@ -81,6 +81,6 @@ should be handled properly (crashed the server before)
 --- raw_response_headers_unlike eval
 ["========","==========","X-NGX-NTLM-AUTH: "]
 --- no_error_log
-[error]
+\[error\]
 --- SKIP # pipelined_requests does not support spliting into packets ... yet
 

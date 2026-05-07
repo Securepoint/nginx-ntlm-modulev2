@@ -102,6 +102,29 @@ prove -r t
 |---------------|-------|
 | < 1.25        | Not supported. |
 | ≥ 1.25        | Supported. This module targets nginx 1.25 and later. It correctly stores cache-item pointers in `c->read->data` (not `c->data`) to avoid the segfault regression introduced in the 1.25/1.26/1.27/1.28 series. |
+| master (1.31+) | Supported. See [nginx master compatibility](#nginx-master-compatibility) below. |
+
+## nginx master compatibility
+
+nginx master (≥ 1.31) introduced **automatic keepalive injection**: the built-in
+`ngx_http_upstream_keepalive_module` now installs a peer wrapper for every
+upstream in its `init_main_conf` hook — even when no explicit `keepalive N`
+directive is present.  If the NTLM module's peer wrapper was installed during
+`init_upstream` (as it was in earlier versions of this module), the keepalive
+wrapper ended up on the *outside*, intercepting `free_peer` calls before NTLM
+could pin the upstream connection.  The keepalive module then cached the
+connection itself and set `pc->connection = NULL`, causing NTLM's `free_peer`
+to bail out via the `c == NULL` guard — so NTLM never registered the connection
+in its own cache.  Subsequent requests were round-robined across servers rather
+than staying pinned to the authenticated upstream.
+
+**Fix (shipped in this version):** The peer-init wrapping was moved from
+`ngx_http_upstream_init_ntlm` (`init_upstream`) to a new
+`ngx_http_upstream_ntlm_init_main_conf` (`init_main_conf`) hook.
+`--add-module` extensions are assigned higher module indices than all built-in
+modules, so NTLM's `init_main_conf` always runs *after* the keepalive module's
+`init_main_conf`.  This keeps NTLM as the outermost peer wrapper regardless of
+nginx version.
 
 ## Acknowledgments
 
@@ -124,4 +147,7 @@ prove -r t
 - Synchronous client-connection cleanup (no posted events)
 - Add `ntlm_time` and `ntlm_requests` directives
 - Add `notify` peer callback pass-through
+- Fix NTLM pinning broken on nginx master (≥ 1.31): move peer-init wrapping
+  to `init_main_conf` so NTLM is always the outermost peer wrapper, even when
+  the keepalive module auto-injects its own wrapper
 
