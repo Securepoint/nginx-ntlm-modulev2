@@ -51,6 +51,5 @@ jobs:
 
       - name: Run test suite
         run: |
-          echo "$RUNNER_TEMP/nginx/sbin" >> "$GITHUB_PATH"
           export PATH="$RUNNER_TEMP/nginx/sbin:$PATH"
           prove -r "$GITHUB_WORKSPACE/t"
