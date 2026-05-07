@@ -212,3 +212,31 @@ ntlm: failed to allocate cleanup handler
 --- raw_response_headers_unlike eval
 ["========", "X-NGX-NTLM-AUTH: "]
 
+
+=== TEST 7: Explicit keepalive + ntlm should keep upstream session pinned
+When an upstream config includes explicit keepalive, placing keepalive before
+ntlm must still keep the authenticated upstream connection pinned for
+subsequent requests on the same client connection.
+--- http_config
+    upstream backend {
+        server localhost:19841;
+        server localhost:19842;
+        keepalive 16;
+        ntlm;
+    }
+--- config
+    location /t {
+        proxy_pass http://backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+--- pipelined_requests eval
+["GET /t", "GET /t", "GET /t"]
+--- more_headers eval
+["Authorization: NTLM " . $::random_token, "", ""]
+--- response_body eval
+["OK", "OK", "OK"]
+--- response_headers eval
+["X-NGX-NTLM-AUTH: " . $::random_token, "X-NGX-NTLM-AUTH: " . $::random_token, "X-NGX-NTLM-AUTH: " . $::random_token]
+--- no_error_log
+\[error\]

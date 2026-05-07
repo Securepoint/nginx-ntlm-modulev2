@@ -27,6 +27,7 @@ This is a full rewrite of the original [nginx-ntlm-module](https://github.com/Se
 upstream http_backend {
     server 127.0.0.1:8080;
 
+    keepalive 16;
     ntlm;
 }
 
@@ -43,6 +44,7 @@ server {
 ```
 
 The connections parameter sets the maximum number of connections to the upstream servers that are preserved in the cache.
+If you configure explicit upstream keepalive, declare `keepalive` **before** `ntlm` in the same `upstream` block.
 
 > Syntax:  ntlm_timeout timeout;  
 > Default: ntlm_timeout 60s;  
@@ -150,4 +152,3 @@ nginx version.
 - Fix NTLM pinning broken on nginx master (≥ 1.31): move peer-init wrapping
   to `init_main_conf` so NTLM is always the outermost peer wrapper, even when
   the keepalive module auto-injects its own wrapper
-
