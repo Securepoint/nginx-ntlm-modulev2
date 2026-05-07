@@ -8,8 +8,11 @@ my $string_gen = String::Random->new;
 my %seen_tokens;
 
 sub unique_token {
-    my $token;
-    do { $token = $string_gen->randpattern("CcCcCcCCcC"); } while $seen_tokens{$token}++;
+    my $token = $string_gen->randpattern("CcCcCcCCcC");
+    while (exists $seen_tokens{$token}) {
+        $token = $string_gen->randpattern("CcCcCcCCcC");
+    }
+    $seen_tokens{$token} = 1;
     return $token;
 }
 
@@ -25,7 +28,7 @@ our $token_y = unique_token();
 # Start the nodejs backend
 my $pid = fork();
 if ($pid == 0) {  #child
-    exec("node t/backend/index.js");
+    exec("node t/backend/index.js") or die "failed to start backend: $!";
 } else { #parent
     sleep 1;
 }
