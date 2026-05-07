@@ -27,6 +27,7 @@ our $token_y = unique_token();
 
 # Start the nodejs backend
 my $pid = fork();
+die "failed to fork backend process: $!" unless defined $pid;
 if ($pid == 0) {  # child
     exec("node t/backend/index.js") or die "failed to start backend: $!";
 } else { # parent
