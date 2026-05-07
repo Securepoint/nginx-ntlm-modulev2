@@ -275,10 +275,14 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
 
         if ((auth.len >= sizeof("NTLM") - 1
              && ngx_strncasecmp(auth.data, (u_char *) "NTLM",
-                                sizeof("NTLM") - 1) == 0)
+                                sizeof("NTLM") - 1) == 0
+             && (auth.len == sizeof("NTLM") - 1
+                 || auth.data[sizeof("NTLM") - 1] == ' '))
             || (auth.len >= sizeof("Negotiate") - 1
                 && ngx_strncasecmp(auth.data, (u_char *) "Negotiate",
-                                   sizeof("Negotiate") - 1) == 0))
+                                   sizeof("Negotiate") - 1) == 0
+                && (auth.len == sizeof("Negotiate") - 1
+                    || auth.data[sizeof("Negotiate") - 1] == ' ')))
         {
             ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "ntlm: authorization header detected");
