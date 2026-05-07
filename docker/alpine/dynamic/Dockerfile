@@ -26,7 +26,7 @@ WORKDIR /build
 # download nginx 
 RUN curl -OL http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
     && tar -xvzf nginx-${NGINX_VERSION}.tar.gz && rm nginx-${NGINX_VERSION}.tar.gz \
-    && git clone https://github.com/Securepoint/nginx-ntlm-module.git nginx-ntlm-modulev2
+    && git clone https://github.com/Securepoint/nginx-ntlm-modulev2.git nginx-ntlm-modulev2
 
 RUN cd nginx-${NGINX_VERSION}/ \
     && ./configure \
