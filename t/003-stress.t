@@ -122,7 +122,7 @@ After ntlm_time has elapsed, a follow-up request must not inherit old auth.
 ["==========", "X-NGX-NTLM-AUTH: "]
 --- no_error_log
 \[error\]
---- SKIP # pipelined_requests does not support spliting into packets ... yet
+--- SKIP # pipelined_requests does not support splitting into packets ... yet
 
 
 === TEST 4: Deep pipelining on a single pinned connection
