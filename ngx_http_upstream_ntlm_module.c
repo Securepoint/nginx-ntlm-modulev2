@@ -725,6 +725,10 @@ ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev)
         goto close;
     }
 
+    if (c->fd == (ngx_socket_t) -1) {
+        goto close;
+    }
+
     n = recv(c->fd, buf, 1, MSG_PEEK);
 
     if (n == -1 && ngx_socket_errno == NGX_EAGAIN) {
@@ -778,11 +782,12 @@ ngx_http_upstream_ntlm_close(ngx_connection_t *c)
     }
 #endif
 
-    if (c->pool) {
-        ngx_destroy_pool(c->pool);
-        c->pool = NULL;
-    }
+    ngx_pool_t *pool = c->pool;
+    c->pool = NULL;
     ngx_close_connection(c);
+    if (pool) {
+        ngx_destroy_pool(pool);
+    }
 }
 
 /* ── SSL session pass-through ────────────────────────────────────────────── */
