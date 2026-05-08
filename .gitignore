@@ -2,3 +2,7 @@
 compile_commands.json
 t/servroot
 t/*/node_modules
+
+# nginx source tarballs
+*.tar.gz
+release-*/
