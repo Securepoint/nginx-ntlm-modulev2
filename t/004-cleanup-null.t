@@ -16,9 +16,9 @@ our $random_token = $string_gen->randpattern("CcCcCcCCcC");
 
 # Start the nodejs backend
 my $pid = fork();
-if ($pid == 0) {  #child
+if ($pid == 0) {  # child
     exec("node t/backend/index.js");
-} else { #parent
+} else { # parent
     sleep 1;
 }
 
