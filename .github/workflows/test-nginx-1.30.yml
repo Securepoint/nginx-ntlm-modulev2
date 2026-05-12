@@ -1,4 +1,4 @@
-name: test nginx 1.30
+name: test nginx
 
 on:
   push:
@@ -12,8 +12,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        nginx-version:
-          - 1.30.0
+        include:
+          - label: "1.30.0"
+            source: release
+            nginx-version: "1.30.0"
+          - label: master
+            source: master
+            nginx-version: master
 
     steps:
       - name: Check out repository
@@ -37,13 +42,19 @@ jobs:
       - name: Install Perl test dependencies
         run: sudo cpanm --notest Module::Build String::Random Test::Nginx
 
-      - name: Build nginx with module
-        env:
-          NGINX_VERSION: ${{ matrix.nginx-version }}
+      - name: Download nginx source
         run: |
-          curl -fsSLO "https://github.com/nginx/nginx/archive/refs/tags/release-${NGINX_VERSION}.tar.gz"
           mkdir -p "$RUNNER_TEMP/nginx-src"
-          tar -xzf "release-${NGINX_VERSION}.tar.gz" -C "$RUNNER_TEMP/nginx-src" --strip-components=1
+          if [ "${{ matrix.source }}" = "release" ]; then
+            curl -fsSLO "https://github.com/nginx/nginx/archive/refs/tags/release-${{ matrix.nginx-version }}.tar.gz"
+            tar -xzf "release-${{ matrix.nginx-version }}.tar.gz" -C "$RUNNER_TEMP/nginx-src" --strip-components=1
+          else
+            curl -fsSLO "https://github.com/nginx/nginx/archive/refs/heads/master.tar.gz"
+            tar -xzf "master.tar.gz" -C "$RUNNER_TEMP/nginx-src" --strip-components=1
+          fi
+
+      - name: Build nginx with module
+        run: |
           cd "$RUNNER_TEMP/nginx-src"
           ./auto/configure --prefix="$RUNNER_TEMP/nginx" --add-module="$GITHUB_WORKSPACE"
           make -j"$(nproc)"
