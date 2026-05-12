@@ -1,0 +1,95 @@
+name: test nginx master
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: t/backend/package-lock.json
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl perl cpanminus libpcre2-dev zlib1g-dev
+
+      - name: Install backend dependencies
+        run: npm ci --prefix "$GITHUB_WORKSPACE/t/backend"
+
+      - name: Install Perl test dependencies
+        run: sudo cpanm --notest Module::Build String::Random Test::Nginx
+
+      - name: Build nginx with module
+        run: |
+          curl -fsSLO "https://github.com/nginx/nginx/archive/refs/heads/master.tar.gz"
+          mkdir -p "$RUNNER_TEMP/nginx-src"
+          tar -xzf master.tar.gz -C "$RUNNER_TEMP/nginx-src" --strip-components=1
+          cd "$RUNNER_TEMP/nginx-src"
+          ./auto/configure --prefix="$RUNNER_TEMP/nginx" --add-module="$GITHUB_WORKSPACE"
+          make -j"$(nproc)"
+          make install
+
+      - name: Run test suite (excluding fault-injection-only test)
+        run: |
+          export PATH="$RUNNER_TEMP/nginx/sbin:$PATH"
+          find "$GITHUB_WORKSPACE/t" -maxdepth 1 -type f -name '*.t' ! -name '004-cleanup-null.t' -print \
+            | sort \
+            | xargs prove
+
+  test-cleanup-null:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: t/backend/package-lock.json
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl perl cpanminus libpcre2-dev zlib1g-dev
+
+      - name: Install backend dependencies
+        run: npm ci --prefix "$GITHUB_WORKSPACE/t/backend"
+
+      - name: Install Perl test dependencies
+        run: sudo cpanm --notest Module::Build String::Random Test::Nginx
+
+      - name: Build nginx with module (fault-injection flag)
+        run: |
+          curl -fsSLO "https://github.com/nginx/nginx/archive/refs/heads/master.tar.gz"
+          mkdir -p "$RUNNER_TEMP/nginx-src"
+          tar -xzf master.tar.gz -C "$RUNNER_TEMP/nginx-src" --strip-components=1
+          cd "$RUNNER_TEMP/nginx-src"
+          ./auto/configure \
+            --prefix="$RUNNER_TEMP/nginx" \
+            --add-module="$GITHUB_WORKSPACE" \
+            --with-cc-opt="-DNGX_NTLM_TEST_CLEANUP_NULL"
+          make -j"$(nproc)"
+          make install
+
+      - name: Run cleanup-null test
+        env:
+          NGX_NTLM_TEST_CLEANUP_NULL: "1"
+        run: |
+          export PATH="$RUNNER_TEMP/nginx/sbin:$PATH"
+          prove "$GITHUB_WORKSPACE/t/004-cleanup-null.t"
