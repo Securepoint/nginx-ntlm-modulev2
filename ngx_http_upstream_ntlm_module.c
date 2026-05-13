@@ -613,11 +613,9 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
      * counter.  pc->connection is already NULL so keepalive's free_peer
      * (if present) will skip its own caching and delegate to round-robin.
      */
-    hndp->original_free_peer(pc, hndp->data, state);
-    return;
-
 invalid:
     hndp->original_free_peer(pc, hndp->data, state);
+    return;
 }
 
 /* ── Client-connection pool cleanup handler ─────────────────────────────── */
