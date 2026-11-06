@@ -40,6 +40,11 @@
  *      three-way NTLM handshake (Type-1/Type-2/Type-3) on a single TCP
  *      connection: c->requests == 1 when the Type-3 message arrives.
  *
+ *  I5. Cached sessions belong to a client connection pointer AND number.
+ *      Client-pool cleanup tracks this owner separately for each upstream
+ *      configuration, never a reusable cache slot, and releases every entry
+ *      belonging to the owner.
+ *
  * ── Configuration directives (upstream context) ────────────────────────────
  *
  *   ntlm [connections]     max cached upstream connections (default: 100)
@@ -100,12 +105,19 @@ typedef struct {
     ngx_queue_t                         queue;
     ngx_connection_t                   *peer_connection;
     ngx_connection_t                   *client_connection;
+    ngx_atomic_uint_t                   client_connection_number;
     /*
      * in_cache is the authoritative ownership indicator (invariant I1).
      * All releases MUST go through ngx_http_upstream_ntlm_item_release().
      */
     unsigned                            in_cache:1;
 } ngx_http_upstream_ntlm_cache_t;
+
+typedef struct {
+    ngx_http_upstream_ntlm_srv_conf_t  *conf;
+    ngx_connection_t                   *client_connection;
+    ngx_atomic_uint_t                   client_connection_number;
+} ngx_http_upstream_ntlm_cleanup_t;
 
 typedef struct {
     ngx_http_upstream_ntlm_srv_conf_t  *conf;
@@ -189,8 +201,8 @@ ngx_module_t ngx_http_upstream_ntlm_module = {
 /*
  * ngx_http_upstream_ntlm_item_release — single, canonical release path.
  *
- * Atomically clears all three ownership fields (in_cache, peer_connection,
- * client_connection) before touching any queue, satisfying invariant I1.
+ * Clears the ownership flag, connection pointers, and client connection number
+ * before touching any queue, satisfying invariant I1.
  * Callers are responsible for closing peer_connection if needed; this
  * function only manages the item's queue state.
  */
@@ -200,6 +212,7 @@ ngx_http_upstream_ntlm_item_release(ngx_http_upstream_ntlm_cache_t *item)
     item->in_cache = 0;
     item->peer_connection = NULL;
     item->client_connection = NULL;
+    item->client_connection_number = 0;
     ngx_queue_remove(&item->queue);
     ngx_queue_insert_head(&item->conf->free, &item->queue);
 }
@@ -263,6 +276,15 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
     ngx_str_t                            auth;
 
     hncf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_ntlm_module);
+
+#if (NGX_HTTP_V2)
+    if (r->stream) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "ntlm: HTTP/2 requests are not supported for ntlm "
+                      "upstreams");
+        return NGX_ERROR;
+    }
+#endif
 
     hnpd = ngx_palloc(r->pool, sizeof(ngx_http_upstream_ntlm_peer_data_t));
     if (hnpd == NULL) {
@@ -349,7 +371,10 @@ ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data)
     {
         item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
 
-        if (item->client_connection != hndp->client_connection) {
+        if (item->client_connection != hndp->client_connection
+            || item->client_connection_number
+               != hndp->client_connection->number)
+        {
             continue;
         }
 
@@ -443,7 +468,7 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
     ngx_connection_t                    *c;
     ngx_http_upstream_t                 *u;
     ngx_pool_cleanup_t                  *cln;
-    ngx_http_upstream_ntlm_cache_t      *cleanup_item;
+    ngx_http_upstream_ntlm_cleanup_t    *cleanup;
 
     u = hndp->upstream;
     c = pc->connection;
@@ -523,6 +548,7 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
 
     item->peer_connection   = c;
     item->client_connection = hndp->client_connection;
+    item->client_connection_number = hndp->client_connection->number;
     item->in_cache          = 1;
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
@@ -538,24 +564,31 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
      * item would hold a client_connection pointer that nginx may recycle for a
      * different client, enabling a session-hijack via pointer reuse (ABA).
      *
-     * If the client connection already has a handler from a previous request,
-     * update its data pointer to the current item instead of registering a
-     * second handler.
+     * Register once per client connection and upstream configuration.  Cleanup
+     * tracks the owner, not a cache slot that may be reassigned to another
+     * client, and releases every entry belonging to that owner.
      */
-    cleanup_item = NULL;
+    cleanup = NULL;
     for (cln = item->client_connection->pool->cleanup;
          cln != NULL;
          cln = cln->next)
     {
         if (cln->handler == ngx_http_upstream_client_conn_cleanup) {
-            cln->data    = item;
-            cleanup_item = item;
-            break;
-        }
+             cleanup = cln->data;
+             if (cleanup->conf == hndp->conf
+                 && cleanup->client_connection == item->client_connection
+                 && cleanup->client_connection_number
+                    == item->client_connection_number)
+             {
+                 break;
+             }
+             cleanup = NULL;
+         }
     }
 
-    if (cleanup_item == NULL) {
-        cln = ngx_pool_cleanup_add(item->client_connection->pool, 0);
+    if (cleanup == NULL) {
+         cln = ngx_pool_cleanup_add(item->client_connection->pool,
+                                   sizeof(ngx_http_upstream_ntlm_cleanup_t));
         if (cln == NULL) {
             ngx_log_error(NGX_LOG_ERR, pc->log, 0,
                           "ntlm: failed to allocate cleanup handler,"
@@ -567,8 +600,11 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
             ngx_http_upstream_ntlm_item_release(item);
             goto invalid;
         }
+        cleanup = cln->data;
+        cleanup->conf = hndp->conf;
+        cleanup->client_connection = item->client_connection;
+        cleanup->client_connection_number = item->client_connection_number;
         cln->handler = ngx_http_upstream_client_conn_cleanup;
-        cln->data    = item;
     }
 
     pc->connection    = NULL;
@@ -622,8 +658,8 @@ invalid:
 
 /*
  * Called when the client connection's pool is destroyed (i.e. the client
- * disconnects).  Closes the bound upstream connection synchronously so that
- * the item is immediately returned to the free list.  Must NOT post an event:
+ * disconnects).  Closes all of the owner's cached upstream connections
+ * synchronously.  Must NOT post an event:
  * a posted event fires asynchronously and by that time the upstream connection
  * may have been claimed for a new request, causing a double-close or queue
  * corruption.
@@ -631,39 +667,44 @@ invalid:
 static void
 ngx_http_upstream_client_conn_cleanup(void *data)
 {
-    ngx_http_upstream_ntlm_cache_t  *item = data;
-    ngx_connection_t                *c;
+    ngx_http_upstream_ntlm_cleanup_t  *cleanup = data;
+    ngx_http_upstream_ntlm_cache_t    *item;
+    ngx_queue_t                       *q, *next, *cache;
+    ngx_connection_t                  *c;
 
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                   "ntlm: client connection closed %p, dropping upstream %p",
-                   item->client_connection, item->peer_connection);
+    cache = &cleanup->conf->cache;
 
-    /*
-     * Guard against double-execution (invariant I1).  in_cache == 0 means
-     * the connection was already consumed by get_ntlm_peer or closed by
-     * the close_handler / an eviction.  Nothing to do.
-     */
-    if (!item->in_cache) {
+    for (q = ngx_queue_head(cache);
+         q != ngx_queue_sentinel(cache);
+         q = next)
+    {
+        next = ngx_queue_next(q);
+        item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
+
+        if (!item->in_cache
+            || item->client_connection != cleanup->client_connection
+            || item->client_connection_number
+               != cleanup->client_connection_number)
+        {
+            continue;
+        }
+
+        c = item->peer_connection;
+
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                       "ntlm: upstream already released for client %p/%p",
-                       item->client_connection, item->peer_connection);
-        return;
+                       "ntlm: client connection closed %p, dropping upstream %p",
+                       cleanup->client_connection, c);
+
+        ngx_http_upstream_ntlm_item_release(item);
+
+        if (c != NULL) {
+            if (c->read->timer_set) {
+                ngx_del_timer(c->read);
+            }
+
+            ngx_http_upstream_ntlm_close(c);
+        }
     }
-
-    c = item->peer_connection;
-
-    /* Release the item atomically (invariant I1) before any queue or I/O. */
-    ngx_http_upstream_ntlm_item_release(item);
-
-    if (c == NULL) {
-        return;
-    }
-
-    if (c->read->timer_set) {
-        ngx_del_timer(c->read);
-    }
-
-    ngx_http_upstream_ntlm_close(c);
 }
 
 /* ── Idle-connection event handlers ─────────────────────────────────────── */

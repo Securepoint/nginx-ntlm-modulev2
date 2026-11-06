@@ -4,6 +4,17 @@ The NTLM module allows proxying requests with [NTLM Authentication](https://en.w
 
 This is a full rewrite of the original [nginx-ntlm-module](https://github.com/Securepoint/nginx-ntlm-module), targeting **nginx ≥ 1.25** only. It is a 1:1 drop-in replacement for the original module in terms of configuration directives and behaviour, but does not support older nginx releases.
 
+## HTTP/2 compatibility
+
+This module is intentionally **incompatible with HTTP/2** for requests that
+resolve to an `ntlm` upstream.
+
+HTTP/2 can still be enabled for other servers/locations. When an HTTP/2
+request reaches an `ntlm` upstream, the module rejects it and logs an error.
+
+This guard is deliberate: NTLM connection pinning depends on
+connection semantics that are not compatible with HTTP/2 multiplexing.
+
 ## Security improvements over v1
 
 - **Session-hijack via cleanup-OOM (Critical)** — If `ngx_pool_cleanup_add()` returns NULL the upstream connection is no longer cached. Previously the connection was inserted into the cache with a stale `client_connection` pointer that nginx might later recycle for a different client, allowing `get_ntlm_peer` to hand an already-authenticated session to the wrong client (ABA pointer-reuse attack).
@@ -15,6 +26,8 @@ This is a full rewrite of the original [nginx-ntlm-module](https://github.com/Se
 - **`c->data` segfault on nginx ≥ 1.25** — Upstream connections idle in the NTLM cache store the cache-item pointer in `c->read->data` instead of `c->data`. nginx's `ngx_http_upstream_handler()` requires `c->data` to hold the request pointer; overwriting it with the cache item caused segfaults on nginx ≥ 1.25.
 
 - **Synchronous cleanup** — The client-connection pool cleanup handler closes the bound upstream connection synchronously. Earlier versions posted an event which could fire after the cache slot had already been reused, causing queue corruption and segfaults.
+
+- **Cleanup ownership across upstream groups** — Each client connection registers cleanup separately for every NTLM upstream group it uses. Cleanup releases all matching cached sessions without retaining pointers to reusable cache slots. Cache lookup and cleanup match both the client connection pointer and its connection number, preventing a recycled address from selecting another client's session.
 
 ## How to use
 
@@ -95,8 +108,12 @@ cpan Test::Nginx
 export PATH=/opt/local/nginx/sbin:$PATH
 
 prove -r t
+python3 -m unittest discover -s t -p 'test_*.py'
 ```
 
+The ownership regression tests require Python 3 (standard library only) and an
+nginx binary built with this module. They cover multi-upstream disconnect
+cleanup, cache-slot reassignment, and session isolation across new clients.
 
 ## nginx Version Compatibility
 

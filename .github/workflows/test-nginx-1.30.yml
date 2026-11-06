@@ -67,3 +67,4 @@ jobs:
         run: |
           export PATH="$RUNNER_TEMP/nginx/sbin:$PATH"
           prove -r "$GITHUB_WORKSPACE/t"
+          python3 -m unittest discover -s "$GITHUB_WORKSPACE/t" -p 'test_*.py'
