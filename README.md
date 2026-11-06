@@ -16,6 +16,8 @@ This is a full rewrite of the original [nginx-ntlm-module](https://github.com/Se
 
 - **Synchronous cleanup** — The client-connection pool cleanup handler closes the bound upstream connection synchronously. Earlier versions posted an event which could fire after the cache slot had already been reused, causing queue corruption and segfaults.
 
+- **Cleanup ownership across upstream groups** — Each client connection registers cleanup separately for every NTLM upstream group it uses. Cleanup releases all matching cached sessions without retaining pointers to reusable cache slots. Cache lookup and cleanup match both the client connection pointer and its connection number, preventing a recycled address from selecting another client's session.
+
 ## How to use
 
 > Syntax:  ntlm [connections];  
@@ -95,8 +97,12 @@ cpan Test::Nginx
 export PATH=/opt/local/nginx/sbin:$PATH
 
 prove -r t
+python3 -m unittest discover -s t -p 'test_*.py'
 ```
 
+The ownership regression tests require Python 3 (standard library only) and an
+nginx binary built with this module. They cover multi-upstream disconnect
+cleanup, cache-slot reassignment, and session isolation across new clients.
 
 ## nginx Version Compatibility
 
