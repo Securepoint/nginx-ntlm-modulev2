@@ -277,6 +277,15 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
 
     hncf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_ntlm_module);
 
+#if (NGX_HTTP_V2)
+    if (r->stream) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "ntlm: HTTP/2 requests are not supported for ntlm "
+                      "upstreams");
+        return NGX_ERROR;
+    }
+#endif
+
     hnpd = ngx_palloc(r->pool, sizeof(ngx_http_upstream_ntlm_peer_data_t));
     if (hnpd == NULL) {
         return NGX_ERROR;
