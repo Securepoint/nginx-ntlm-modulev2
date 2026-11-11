@@ -379,6 +379,13 @@ ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data)
         }
 
         c = item->peer_connection;
+        if (c == NULL) {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                           "ntlm: skipping stale cache entry for client %p",
+                           item->client_connection);
+            ngx_http_upstream_ntlm_item_release(item);
+            continue;
+        }
 
         /*
          * Invariant I4 — stale-credential eviction.
@@ -833,6 +840,18 @@ ngx_http_upstream_ntlm_set_session(ngx_peer_connection_t *pc, void *data)
 {
     ngx_http_upstream_ntlm_peer_data_t  *hndp = data;
 
+    /*
+     * SSL session callbacks apply to new TLS handshakes only.
+     * Reused NTLM-cached upstream connections are already handshaken.
+     */
+    if (pc == NULL || pc->connection == NULL || pc->cached) {
+        return NGX_OK;
+    }
+
+    if (hndp->original_set_session == NULL) {
+        return NGX_OK;
+    }
+
     return hndp->original_set_session(pc, hndp->data);
 }
 
@@ -841,7 +860,13 @@ ngx_http_upstream_ntlm_save_session(ngx_peer_connection_t *pc, void *data)
 {
     ngx_http_upstream_ntlm_peer_data_t  *hndp = data;
 
-    hndp->original_save_session(pc, hndp->data);
+    if (pc == NULL || pc->connection == NULL || pc->cached) {
+        return;
+    }
+
+    if (hndp->original_save_session) {
+        hndp->original_save_session(pc, hndp->data);
+    }
 }
 
 #endif

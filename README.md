@@ -29,6 +29,8 @@ connection semantics that are not compatible with HTTP/2 multiplexing.
 
 - **Cleanup ownership across upstream groups** — Each client connection registers cleanup separately for every NTLM upstream group it uses. Cleanup releases all matching cached sessions without retaining pointers to reusable cache slots. Cache lookup and cleanup match both the client connection pointer and its connection number, preventing a recycled address from selecting another client's session.
 
+- **HTTPS upstream session-reuse hardening** — NTLM now skips upstream SSL session set/save callbacks for reused cached connections and guards null callback/connection states. This prevents invalid TLS session operations on already-handshaken pinned connections and avoids NULL-connection crashes in upstream SSL session handling paths.
+
 ## How to use
 
 > Syntax:  ntlm [connections];  
