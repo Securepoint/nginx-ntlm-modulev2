@@ -673,6 +673,7 @@ invalid:
     hndp->original_free_peer(pc, hndp->data, state);
 
     if (c != NULL) {
+        /* Caching is finished; restore the socket for core teardown, not reuse. */
         pc->connection = c;
     }
 
