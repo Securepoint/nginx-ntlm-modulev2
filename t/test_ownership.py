@@ -238,7 +238,7 @@ class SessionAgeTests(OwnershipTestCase):
         owner = self.client()
         self.assertEqual(self.request(owner, "/a", "alpha"), "NTLM alpha")
         time.sleep(0.05)
-        self.assertEqual(self.request(owner, "/a"), "NTLM alpha")
+        self.assertIsNone(self.request(owner, "/a"))
         self.assertIsNone(self.request(self.client(), "/a"))
         self.wait_for_sessions(0)
         self.assertIsNone(self.request(owner, "/a"))

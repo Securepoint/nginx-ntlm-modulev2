@@ -1,0 +1,2 @@
+aioquic==1.7.2
+pyspnego==0.12.4

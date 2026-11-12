@@ -37,7 +37,13 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential curl perl cpanminus libpcre2-dev zlib1g-dev
+          sudo apt-get install -y build-essential curl perl cpanminus libpcre2-dev zlib1g-dev libssl-dev python3-venv
+
+      - name: Install protocol test dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/protocol-tests"
+          "$RUNNER_TEMP/protocol-tests/bin/pip" install -r t/requirements.txt
+          echo "$RUNNER_TEMP/protocol-tests/bin" >> "$GITHUB_PATH"
 
       - name: Install backend dependencies
         run: npm ci --prefix "$GITHUB_WORKSPACE/t/backend"
@@ -59,7 +65,8 @@ jobs:
       - name: Build nginx with module
         run: |
           cd "$RUNNER_TEMP/nginx-src"
-          ./auto/configure --prefix="$RUNNER_TEMP/nginx" --add-module="$GITHUB_WORKSPACE"
+          ./auto/configure --prefix="$RUNNER_TEMP/nginx" --add-module="$GITHUB_WORKSPACE" \
+            --with-debug --with-http_ssl_module --with-http_v2_module --with-http_v3_module
           make -j"$(nproc)"
           make install
 
@@ -68,6 +75,7 @@ jobs:
           cd "$RUNNER_TEMP/nginx-src"
           ./auto/configure --prefix="$RUNNER_TEMP/nginx-cleanup-null" \
             --add-module="$GITHUB_WORKSPACE" \
+            --with-debug --with-http_ssl_module --with-http_v2_module --with-http_v3_module \
             --with-cc-opt="-DNGX_NTLM_TEST_CLEANUP_NULL"
           make -j"$(nproc)"
           make install

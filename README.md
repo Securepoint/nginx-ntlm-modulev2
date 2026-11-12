@@ -4,22 +4,22 @@ The NTLM module allows proxying requests with [NTLM Authentication](https://en.w
 
 This is a full rewrite of the original [nginx-ntlm-module](https://github.com/Securepoint/nginx-ntlm-module), targeting **nginx ≥ 1.25** only. It is a 1:1 drop-in replacement for the original module in terms of configuration directives and behaviour, but does not support older nginx releases.
 
-## HTTP/2 compatibility
+## HTTP/2 and HTTP/3 compatibility
 
-This module is intentionally **incompatible with HTTP/2** for requests that
+This module is intentionally **incompatible with HTTP/2 and HTTP/3** for requests that
 resolve to an `ntlm` upstream.
 
-HTTP/2 can still be enabled for other servers/locations. When an HTTP/2
+Both protocols can still be enabled for other servers/locations. When an HTTP/2 or HTTP/3
 request reaches an `ntlm` upstream, the module rejects it and logs an error.
 
 This guard is deliberate: NTLM connection pinning depends on
-connection semantics that are not compatible with HTTP/2 multiplexing.
+connection semantics that are not compatible with multiplexed protocols.
 
 ## Security improvements over v1
 
 - **Session-hijack via cleanup-OOM (Critical)** — If `ngx_pool_cleanup_add()` returns NULL the upstream connection is no longer cached. Previously the connection was inserted into the cache with a stale `client_connection` pointer that nginx might later recycle for a different client, allowing `get_ntlm_peer` to hand an already-authenticated session to the wrong client (ABA pointer-reuse attack).
 
-- **Stale-credential reuse (High)** — When a keep-alive client connection sends new `NTLM`/`Negotiate` credentials after the initial handshake has completed (`c->requests >= 2`), the old authenticated upstream session is now evicted and closed, forcing a fresh negotiation. Previously the old session was silently reused regardless of the new credentials.
+- **Stale-credential reuse (High)** — When a keep-alive client connection sends new `NTLM`/`Negotiate` credentials after the upstream stops returning 401 challenges, the old authenticated upstream session is evicted and closed, forcing a fresh negotiation. Challenge responses keep the connection pinned throughout multi-round authentication, independently of prior unauthenticated requests.
 
 - **Atomic item release** — A dedicated `ngx_http_upstream_ntlm_item_release()` helper is the single canonical code path for returning a cache item to the free list. It atomically clears `in_cache`, `peer_connection`, and `client_connection` before any queue operation, preventing any concurrent handler from operating on a partially-released item.
 
@@ -30,6 +30,8 @@ connection semantics that are not compatible with HTTP/2 multiplexing.
 - **Cleanup ownership across upstream groups** — Each client connection registers cleanup separately for every NTLM upstream group it uses. Cleanup releases all matching cached sessions without retaining pointers to reusable cache slots. Cache lookup and cleanup match both the client connection pointer and its connection number, preventing a recycled address from selecting another client's session.
 
 - **Shared-cache isolation** — NTLM connections rejected from the private cache, including request/age retirement and cleanup-allocation failure, are withheld from lower-layer shared keepalive caches. Balancer accounting still runs, and nginx core closes the rejected socket. Non-NTLM connections can still use shared keepalive normally.
+
+- **Pinned-session priority** — A client's private session takes precedence over unrelated sockets selected by shared keepalive. Expired private sessions are closed before reuse.
 
 - **HTTPS upstream session-reuse hardening** — NTLM now skips upstream SSL session set/save callbacks for reused cached connections and guards null callback/connection states. This prevents invalid TLS session operations on already-handshaken pinned connections and avoids NULL-connection crashes in upstream SSL session handling paths.
 
@@ -99,7 +101,9 @@ To build this as a dynamic module run:
 
 ## Tests
 
-In order to run the tests you need nodejs and perl installed on your system
+In order to run the tests you need Node.js, Perl, Python 3 and the OpenSSL CLI installed on your system.
+The protocol tests need an nginx binary built with `--with-debug`,
+`--with-http_ssl_module`, `--with-http_v2_module` and `--with-http_v3_module`.
 
 ```bash
 # install the backend packages
@@ -107,6 +111,10 @@ npm install -C t/backend
 
 # install the test framework
 cpan Test::Nginx
+
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r t/requirements.txt
 
 # set the path to your nginx location
 export PATH=/opt/local/nginx/sbin:$PATH
@@ -120,6 +128,11 @@ nginx binary built with this module. They cover multi-upstream disconnect
 cleanup, cache-slot reassignment, session isolation across new clients, and
 rejected-session isolation from shared keepalive caches. Shared-cache tests use
 `max_conns=1` to also exercise balancer accounting.
+
+Protocol regressions use real NTLM messages and a local credential verifier,
+plus certificate-verified HTTP/3 and cleartext HTTP/2 connections. They cover challenge-first
+negotiation, credential replacement, shared-cache pinning, age limits and
+per-upstream protocol rejection. Test credentials are synthetic and temporary.
 
 To include the cleanup-allocation failure regression, build a second nginx
 binary with `--with-cc-opt="-DNGX_NTLM_TEST_CLEANUP_NULL"` and run:
@@ -140,7 +153,7 @@ python3 -m unittest discover -s t -p 'test_*.py'
 
 ## nginx master compatibility
 
-nginx master (≥ 1.31) introduced **automatic keepalive injection**: the built-in
+Recent nginx releases (including 1.30 and master) use **automatic keepalive injection**: the built-in
 `ngx_http_upstream_keepalive_module` now installs a peer wrapper for every
 upstream in its `init_main_conf` hook — even when no explicit `keepalive N`
 directive is present.  If the NTLM module's peer wrapper was installed during

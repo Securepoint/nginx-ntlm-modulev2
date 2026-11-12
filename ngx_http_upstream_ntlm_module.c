@@ -111,6 +111,7 @@ typedef struct {
      * All releases MUST go through ngx_http_upstream_ntlm_item_release().
      */
     unsigned                            in_cache:1;
+    unsigned                            authenticated:1;
 } ngx_http_upstream_ntlm_cache_t;
 
 typedef struct {
@@ -126,6 +127,7 @@ typedef struct {
     ngx_connection_t                   *client_connection;
     unsigned                            cached:1;
     unsigned                            ntlm_init:1;
+    unsigned                            authenticated:1;
     ngx_event_get_peer_pt               original_get_peer;
     ngx_event_free_peer_pt              original_free_peer;
     ngx_event_notify_peer_pt            original_notify;
@@ -213,6 +215,7 @@ ngx_http_upstream_ntlm_item_release(ngx_http_upstream_ntlm_cache_t *item)
     item->peer_connection = NULL;
     item->client_connection = NULL;
     item->client_connection_number = 0;
+    item->authenticated = 0;
     ngx_queue_remove(&item->queue);
     ngx_queue_insert_head(&item->conf->free, &item->queue);
 }
@@ -277,14 +280,12 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
 
     hncf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_ntlm_module);
 
-#if (NGX_HTTP_V2)
-    if (r->stream) {
+    if (r->http_version >= NGX_HTTP_VERSION_20) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "ntlm: HTTP/2 requests are not supported for ntlm "
+                      "ntlm: HTTP/2 and HTTP/3 requests are not supported for ntlm "
                       "upstreams");
         return NGX_ERROR;
     }
-#endif
 
     hnpd = ngx_palloc(r->pool, sizeof(ngx_http_upstream_ntlm_peer_data_t));
     if (hnpd == NULL) {
@@ -297,6 +298,7 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
 
     hnpd->ntlm_init = 0;
     hnpd->cached    = 0;
+    hnpd->authenticated = 0;
 
     if (r->headers_in.authorization != NULL) {
         auth = r->headers_in.authorization->value;
@@ -359,7 +361,7 @@ ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data)
     ngx_connection_t                    *c;
 
     rc = hndp->original_get_peer(pc, hndp->data);
-    if (rc != NGX_OK) {
+    if (rc != NGX_OK && rc != NGX_DONE) {
         return rc;
     }
 
@@ -387,24 +389,16 @@ ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data)
             continue;
         }
 
-        /*
-         * Invariant I4 — stale-credential eviction.
-         *
-         * If new NTLM/Negotiate credentials arrived and the upstream TCP
-         * connection has already completed its handshake (c->requests >= 2),
-         * close the old authenticated session so that the new identity gets a
-         * fresh upstream connection.  The >= 2 threshold preserves the ability
-         * to send the NTLM Type-3 message on the same TCP connection as
-         * Type-1 (c->requests == 1 at that point).
-         */
-        if (hndp->ntlm_init && c->requests >= 2) {
+        if (ngx_current_msec - c->start_time > hndp->conf->time
+            || (hndp->ntlm_init && item->authenticated))
+        {
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
-                           "ntlm: new credentials on established session, "
-                           "evicting upstream connection %p (requests=%ui)",
+                           "ntlm: retiring expired or reauthenticated "
+                           "upstream connection %p (requests=%ui)",
                            c, c->requests);
             ngx_http_upstream_ntlm_item_release(item);
             ngx_http_upstream_ntlm_close(c);
-            break; /* fall through → NGX_OK → fresh upstream connection */
+            break;
         }
 
         /*
@@ -412,15 +406,25 @@ ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data)
          * so ownership fields and queue movement stay atomic and consistent
          * (invariant I1).
          */
+        hndp->authenticated = item->authenticated;
         ngx_http_upstream_ntlm_item_release(item);
 
         hndp->cached = 1;
         goto found;
     }
 
-    return NGX_OK;
+    return rc;
 
 found:
+
+    /*
+     * Keep the balancer reservation, but discard an unrelated shared socket
+     * selected by its keepalive wrapper in favor of the owner's pinned socket.
+     */
+    if (rc == NGX_DONE && pc->connection != NULL) {
+        ngx_http_upstream_ntlm_close(pc->connection);
+        pc->connection = NULL;
+    }
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
                    "ntlm: reusing upstream connection %p", c);
@@ -557,6 +561,9 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
     item->client_connection = hndp->client_connection;
     item->client_connection_number = hndp->client_connection->number;
     item->in_cache          = 1;
+    /* A 401 challenge continues negotiation regardless of prior request count. */
+    item->authenticated = hndp->authenticated
+                          || u->headers_in.status_n != NGX_HTTP_UNAUTHORIZED;
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
                    "ntlm: caching upstream connection %p for client %p",
@@ -765,7 +772,7 @@ ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev)
 {
     ngx_http_upstream_ntlm_cache_t  *item;
     ngx_connection_t                *c;
-    int                              n;
+    ngx_int_t                        n = 0;
     char                             buf[1];
 
     /*
