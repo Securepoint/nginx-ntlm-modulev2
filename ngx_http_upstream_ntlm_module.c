@@ -657,7 +657,25 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
      * (if present) will skip its own caching and delegate to round-robin.
      */
 invalid:
+    /*
+     * Rejected NTLM sessions must not enter a lower layer's shared cache.
+     * Withhold the connection while releasing balancer accounting, then
+     * restore it so upstream core closes it on finalization or retry.
+     * Successful private caching has already cleared pc->connection.
+     * Non-NTLM connections retain the lower layer's normal caching behavior.
+     */
+    c = NULL;
+    if (hndp->ntlm_init || hndp->cached) {
+        c = pc->connection;
+        pc->connection = NULL;
+    }
+
     hndp->original_free_peer(pc, hndp->data, state);
+
+    if (c != NULL) {
+        pc->connection = c;
+    }
+
     return;
 }
 

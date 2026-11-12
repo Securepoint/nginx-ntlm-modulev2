@@ -63,8 +63,18 @@ jobs:
           make -j"$(nproc)"
           make install
 
+      - name: Build cleanup-allocation fault-injection binary
+        run: |
+          cd "$RUNNER_TEMP/nginx-src"
+          ./auto/configure --prefix="$RUNNER_TEMP/nginx-cleanup-null" \
+            --add-module="$GITHUB_WORKSPACE" \
+            --with-cc-opt="-DNGX_NTLM_TEST_CLEANUP_NULL"
+          make -j"$(nproc)"
+          make install
+
       - name: Run test suite
         run: |
           export PATH="$RUNNER_TEMP/nginx/sbin:$PATH"
+          export TEST_NGINX_CLEANUP_NULL_BINARY="$RUNNER_TEMP/nginx-cleanup-null/sbin/nginx"
           prove -r "$GITHUB_WORKSPACE/t"
           python3 -m unittest discover -s "$GITHUB_WORKSPACE/t" -p 'test_*.py'

@@ -29,6 +29,8 @@ connection semantics that are not compatible with HTTP/2 multiplexing.
 
 - **Cleanup ownership across upstream groups** — Each client connection registers cleanup separately for every NTLM upstream group it uses. Cleanup releases all matching cached sessions without retaining pointers to reusable cache slots. Cache lookup and cleanup match both the client connection pointer and its connection number, preventing a recycled address from selecting another client's session.
 
+- **Shared-cache isolation** — NTLM connections rejected from the private cache, including request/age retirement and cleanup-allocation failure, are withheld from lower-layer shared keepalive caches. Balancer accounting still runs, and nginx core closes the rejected socket. Non-NTLM connections can still use shared keepalive normally.
+
 - **HTTPS upstream session-reuse hardening** — NTLM now skips upstream SSL session set/save callbacks for reused cached connections and guards null callback/connection states. This prevents invalid TLS session operations on already-handshaken pinned connections and avoids NULL-connection crashes in upstream SSL session handling paths.
 
 ## How to use
@@ -115,7 +117,18 @@ python3 -m unittest discover -s t -p 'test_*.py'
 
 The ownership regression tests require Python 3 (standard library only) and an
 nginx binary built with this module. They cover multi-upstream disconnect
-cleanup, cache-slot reassignment, and session isolation across new clients.
+cleanup, cache-slot reassignment, session isolation across new clients, and
+rejected-session isolation from shared keepalive caches. Shared-cache tests use
+`max_conns=1` to also exercise balancer accounting.
+
+To include the cleanup-allocation failure regression, build a second nginx
+binary with `--with-cc-opt="-DNGX_NTLM_TEST_CLEANUP_NULL"` and run:
+
+```bash
+TEST_NGINX_BINARY=/path/to/normal/nginx \
+TEST_NGINX_CLEANUP_NULL_BINARY=/path/to/fault-injection/nginx \
+python3 -m unittest discover -s t -p 'test_*.py'
+```
 
 ## nginx Version Compatibility
 

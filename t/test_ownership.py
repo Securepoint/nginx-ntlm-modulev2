@@ -32,6 +32,7 @@ class BackendHandler(BaseHTTPRequestHandler):
             token = self.server.authenticated.get(self.connection)
 
         self.send_response(200)
+        self.send_header("X-NGX-CONNECTION-ID", str(self.client_address[1]))
         if token:
             self.send_header("X-NGX-NTLM-AUTH", token)
         self.send_header("Content-Length", "2")
@@ -50,9 +51,13 @@ class BackendHandler(BaseHTTPRequestHandler):
         pass
 
 
-class OwnershipTests(unittest.TestCase):
+class OwnershipTestCase(unittest.TestCase):
+    upstream_options = ""
+    server_options = ""
+    nginx_environment = "TEST_NGINX_BINARY"
+
     def setUp(self):
-        nginx = shutil.which(os.environ.get("TEST_NGINX_BINARY", "nginx"))
+        nginx = shutil.which(os.environ.get(self.nginx_environment, "nginx"))
         if nginx is None:
             self.fail("nginx is required; build it with this module first")
 
@@ -82,11 +87,13 @@ events {{ worker_connections 128; }}
 http {{
     access_log off;
     upstream backend_a {{
-        server 127.0.0.1:{backend_port};
+        server 127.0.0.1:{backend_port} {self.server_options};
+        {self.upstream_options}
         ntlm 1;
     }}
     upstream backend_b {{
-        server 127.0.0.1:{backend_port};
+        server 127.0.0.1:{backend_port} {self.server_options};
+        {self.upstream_options}
         ntlm 1;
     }}
     server {{
@@ -156,6 +163,8 @@ http {{
                 f"got {len(self.backend.authenticated)}",
             )
 
+
+class OwnershipTests(OwnershipTestCase):
     def test_disconnect_cleans_every_upstream_group(self):
         client = self.client()
         self.assertEqual(self.request(client, "/a", "alpha"), "NTLM alpha")
@@ -189,6 +198,73 @@ http {{
             self.assertIsNone(self.request(stranger, "/b"))
             self.disconnect(stranger)
         self.wait_for_sessions(0)
+
+
+class SharedCacheTests(OwnershipTestCase):
+    upstream_options = "keepalive 16; keepalive_requests 100; ntlm_requests 3;"
+    server_options = "max_conns=1"
+
+    def test_request_limit_closes_session_without_sharing_it(self):
+        owner = self.client()
+        self.assertEqual(self.request(owner, "/a", "alpha"), "NTLM alpha")
+        self.assertEqual(self.request(owner, "/a"), "NTLM alpha")
+        self.assertEqual(self.request(owner, "/a"), "NTLM alpha")
+
+        stranger = self.client()
+        self.assertIsNone(self.request(stranger, "/a"))
+        self.wait_for_sessions(0)
+        self.assertIsNone(self.request(owner, "/a"))
+        self.assertEqual(self.request(owner, "/a", "beta"), "NTLM beta")
+
+    def test_plain_requests_still_use_shared_keepalive(self):
+        connection_ids = []
+        for _ in range(5):
+            client = self.client()
+            client.request("GET", "/a")
+            response = client.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b"OK")
+            self.assertIsNone(response.getheader("X-NGX-NTLM-AUTH"))
+            connection_ids.append(response.getheader("X-NGX-CONNECTION-ID"))
+        self.assertIsNotNone(connection_ids[0])
+        self.assertEqual(len(set(connection_ids)), 1)
+
+
+class SessionAgeTests(OwnershipTestCase):
+    upstream_options = "keepalive 16; keepalive_time 1h; ntlm_time 10ms;"
+    server_options = "max_conns=1"
+
+    def test_expired_session_is_closed_without_sharing_it(self):
+        owner = self.client()
+        self.assertEqual(self.request(owner, "/a", "alpha"), "NTLM alpha")
+        time.sleep(0.05)
+        self.assertEqual(self.request(owner, "/a"), "NTLM alpha")
+        self.assertIsNone(self.request(self.client(), "/a"))
+        self.wait_for_sessions(0)
+        self.assertIsNone(self.request(owner, "/a"))
+
+
+@unittest.skipUnless(
+    os.environ.get("TEST_NGINX_CLEANUP_NULL_BINARY"),
+    "requires nginx built with -DNGX_NTLM_TEST_CLEANUP_NULL",
+)
+class CleanupFailureTests(OwnershipTestCase):
+    upstream_options = "keepalive 16; keepalive_requests 100;"
+    server_options = "max_conns=1"
+    nginx_environment = "TEST_NGINX_CLEANUP_NULL_BINARY"
+
+    def test_cleanup_failure_closes_session_without_sharing_it(self):
+        owner = self.client()
+        for index in range(3):
+            token = f"alpha-{index}"
+            self.assertEqual(self.request(owner, "/a", token), f"NTLM {token}")
+            self.assertIsNone(self.request(self.client(), "/a"))
+            self.wait_for_sessions(0)
+            self.assertIsNone(self.request(owner, "/a"))
+        self.assertIn(
+            "ntlm: failed to allocate cleanup handler",
+            self.error_log.read_text(),
+        )
 
 
 if __name__ == "__main__":
