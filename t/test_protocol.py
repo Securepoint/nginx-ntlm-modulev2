@@ -41,26 +41,60 @@ class NTLMHandler(BaseHTTPRequestHandler):
             if not self.context or not self.context.complete:
                 status, challenge = 401, "NTLM"
         else:
-            message = base64.b64decode(authorization.split(" ", 1)[1])
-            message_type = int.from_bytes(message[8:12], "little")
+            scheme, encoded = authorization.split(" ", 1)
+            message = base64.b64decode(encoded)
+            message_type = (
+                int.from_bytes(message[8:12], "little")
+                if message.startswith(b"NTLMSSP\0") else 0
+            )
             self.server.messages.append((message_type, self.client_address[1]))
             if self.context is None:
-                self.context = spnego.server(protocol="ntlm")
+                self.context = spnego.server(
+                    protocol="negotiate" if scheme == "Negotiate" else "ntlm"
+                )
             try:
+                if scheme == "NTLM" and (
+                    not message.startswith(b"NTLMSSP\0")
+                    or message_type not in (1, 3)
+                ):
+                    raise ValueError("Invalid client NTLM message")
                 output = self.context.step(message)
                 if output:
-                    challenge = "NTLM " + base64.b64encode(output).decode()
+                    challenge = scheme + " " + base64.b64encode(output).decode()
                 if not self.context.complete:
                     status = 401
-            except (SpnegoError, ValueError) as error:
+            except (SpnegoError, ValueError, StopIteration) as error:
                 self.server.errors.append(str(error))
                 status = 401
         if self.headers.get("X-Audit-Challenge"):
             status, challenge = 401, "NTLM"
+        if self.headers.get("X-Audit-Status"):
+            status = int(self.headers["X-Audit-Status"])
+            if self.headers.get("X-Audit-No-Challenge"):
+                challenge = None
+        if challenge and " " in challenge:
+            self.server.challenges.append(challenge)
+            layout = self.headers.get("X-Audit-Challenge-Layout")
+            if layout == "combined":
+                challenge = 'Basic realm="audit, escaped \\" realm", ' + challenge
+            elif layout == "quoted-only":
+                challenge = 'Basic realm="audit, ' + challenge + '"'
+            elif layout == "different-scheme":
+                challenge = "NTLM " + challenge.split(" ", 1)[1]
+            elif layout == "bare":
+                challenge = challenge.split(" ", 1)[0]
+            elif layout == "reject":
+                challenge = "Negotiate " + base64.b64encode(
+                    b"\xa1\x07\x30\x05\xa0\x03\x0a\x01\x02"
+                ).decode()
+            elif layout == "truncated":
+                challenge = "Negotiate " + base64.b64encode(b"\xa1\x82\xff\xff").decode()
         self.send_response(status)
         self.send_header("Content-Length", "2")
         self.send_header("X-Connection-ID", str(self.client_address[1]))
         if challenge:
+            if self.headers.get("X-Audit-Challenge-Layout") == "separate":
+                self.send_header("WWW-Authenticate", 'Basic realm="audit"')
             self.send_header("WWW-Authenticate", challenge)
         self.end_headers()
         self.wfile.write(b"OK")
@@ -146,7 +180,7 @@ class ProtocolTests(unittest.TestCase):
         os.environ["NTLM_USER_FILE"] = str(credentials)
         backend = ThreadingHTTPServer(("127.0.0.1", 0), NTLMHandler)
         backend.daemon_threads = True
-        backend.messages, backend.errors, backend.requests = [], [], []
+        backend.messages, backend.errors, backend.requests, backend.challenges = [], [], [], []
         thread = threading.Thread(target=backend.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(thread.join)
@@ -224,12 +258,19 @@ http {{
         return client
 
     @staticmethod
-    def request(client, message=None, force_challenge=False):
+    def request(client, message=None, force_challenge=False, scheme="NTLM",
+                status=None, no_challenge=False, challenge_layout=None):
         headers = {}
         if force_challenge:
             headers["X-Audit-Challenge"] = "1"
         if message:
-            headers["Authorization"] = "NTLM " + base64.b64encode(message).decode()
+            headers["Authorization"] = scheme + " " + base64.b64encode(message).decode()
+        if status is not None:
+            headers["X-Audit-Status"] = str(status)
+        if no_challenge:
+            headers["X-Audit-No-Challenge"] = "1"
+        if challenge_layout:
+            headers["X-Audit-Challenge-Layout"] = challenge_layout
         client.request("GET", "/auth", headers=headers)
         response = client.getresponse()
         response.read()
@@ -285,6 +326,150 @@ http {{
         self.assertNotEqual(first["X-Connection-ID"], second["X-Connection-ID"])
         self.assertEqual([kind for kind, _ in backend.messages], [1, 3, 1, 3])
         self.assertFalse(backend.errors)
+
+    def test_error_or_public_response_does_not_finish_ntlm_negotiation(self):
+        backend, port, _, _, _ = self.start()
+        for status in (200, 403, 429, 500):
+            with self.subTest(status=status):
+                client = self.client(port)
+                context = spnego.client(USERNAME, PASSWORD, protocol="ntlm")
+                actual, challenge = self.request(client, context.step())
+                self.assertEqual(actual, 401)
+                actual, intermediate = self.request(
+                    client, status=status, no_challenge=True
+                )
+                self.assertEqual(actual, status)
+                self.assertEqual(
+                    challenge["X-Connection-ID"], intermediate["X-Connection-ID"]
+                )
+                message = context.step(
+                    base64.b64decode(challenge["WWW-Authenticate"].split(" ", 1)[1])
+                )
+                actual, completed = self.request(client, message)
+                self.assertEqual(actual, 200)
+                self.assertEqual(
+                    challenge["X-Connection-ID"], completed["X-Connection-ID"]
+                )
+        self.assertFalse(backend.errors)
+
+    def test_type1_restarts_even_an_unfinished_ntlm_exchange(self):
+        backend, port, _, _, _ = self.start()
+        client = self.client(port)
+        context = spnego.client(USERNAME, PASSWORD, protocol="ntlm")
+        status, first = self.request(client, context.step())
+        self.assertEqual(status, 401)
+        second = self.handshake(client)
+        self.assertNotEqual(first["X-Connection-ID"], second["X-Connection-ID"])
+        self.assertEqual([kind for kind, _ in backend.messages], [1, 1, 3])
+        self.assertFalse(backend.errors)
+
+    def test_spnego_challenges_continue_and_initial_tokens_restart(self):
+        backend, port, _, _, _ = self.start()
+        client = self.client(port)
+        previous = None
+        for response_status in (401, 200, 403, 429, 500):
+            with self.subTest(response_status=response_status):
+                context = spnego.client(USERNAME, PASSWORD, protocol="negotiate")
+                initial = context.step()
+                self.assertEqual(initial[0], 0x60)
+                status, challenge = self.request(
+                    client, initial, scheme="Negotiate", status=response_status
+                )
+                self.assertEqual(status, response_status)
+                current = challenge["X-Connection-ID"]
+                if previous is not None:
+                    self.assertNotEqual(previous, current)
+                message = context.step(
+                    base64.b64decode(challenge["WWW-Authenticate"].split(" ", 1)[1])
+                )
+                status, completed = self.request(client, message, scheme="Negotiate")
+                self.assertEqual(status, 200)
+                self.assertEqual(current, completed["X-Connection-ID"])
+                previous = current
+        self.assertFalse(backend.errors)
+
+    def test_switching_authentication_schemes_restarts_the_connection(self):
+        backend, port, _, _, _ = self.start()
+        client = self.client(port)
+        context = spnego.client(USERNAME, PASSWORD, protocol="negotiate")
+        status, first = self.request(client, context.step(), scheme="Negotiate")
+        self.assertEqual(status, 401)
+        second = self.handshake(client)
+        self.assertNotEqual(first["X-Connection-ID"], second["X-Connection-ID"])
+        self.assertFalse(backend.errors)
+
+    def test_only_matching_token_bearing_challenges_allow_spnego_continuation(self):
+        backend, port, _, _, _ = self.start()
+        for layout, expected in [
+            ("combined", 200), ("separate", 200), ("quoted-only", 401),
+            ("different-scheme", 401), ("bare", 401), ("reject", 401),
+            ("truncated", 401)
+        ]:
+            with self.subTest(layout=layout):
+                client = self.client(port)
+                context = spnego.client(USERNAME, PASSWORD, protocol="negotiate")
+                status, first = self.request(
+                    client, context.step(), scheme="Negotiate",
+                    challenge_layout=layout
+                )
+                self.assertEqual(status, 401)
+                message = context.step(
+                    base64.b64decode(backend.challenges[-1].split(" ", 1)[1])
+                )
+                status, final = self.request(client, message, scheme="Negotiate")
+                self.assertEqual(status, expected)
+                self.assertEqual(
+                    first["X-Connection-ID"] == final["X-Connection-ID"],
+                    expected == 200,
+                )
+
+    def test_raw_ntlm_inside_negotiate_preserves_type3_and_restarts_type1(self):
+        backend, port, _, _, _ = self.start()
+        client = self.client(port)
+        ids = []
+        for _ in range(2):
+            context = spnego.client(USERNAME, PASSWORD, protocol="ntlm")
+            status, first = self.request(client, context.step(), scheme="Negotiate")
+            self.assertEqual(status, 401)
+            message = context.step(
+                base64.b64decode(first["WWW-Authenticate"].split(" ", 1)[1])
+            )
+            status, final = self.request(client, message, scheme="Negotiate")
+            self.assertEqual(status, 200)
+            self.assertEqual(first["X-Connection-ID"], final["X-Connection-ID"])
+            ids.append(final["X-Connection-ID"])
+        self.assertNotEqual(ids[0], ids[1])
+        self.assertFalse(backend.errors)
+
+    def test_completed_spnego_token_does_not_authorize_another_continuation(self):
+        backend, port, _, _, _ = self.start()
+        client = self.client(port)
+        context = spnego.client(USERNAME, PASSWORD, protocol="negotiate")
+        status, challenge = self.request(client, context.step(), scheme="Negotiate")
+        self.assertEqual(status, 401)
+        message = context.step(
+            base64.b64decode(challenge["WWW-Authenticate"].split(" ", 1)[1])
+        )
+        status, completed = self.request(client, message, scheme="Negotiate")
+        self.assertEqual(status, 200)
+        context.step(
+            base64.b64decode(completed["WWW-Authenticate"].split(" ", 1)[1])
+        )
+        self.assertTrue(context.complete)
+        self.assertFalse(backend.errors)
+        status, replay = self.request(client, message, scheme="Negotiate")
+        self.assertEqual(status, 401)
+        self.assertNotEqual(completed["X-Connection-ID"], replay["X-Connection-ID"])
+
+    def test_unrecognized_credentials_do_not_inherit_the_old_session(self):
+        _, port, _, _, _ = self.start()
+        client = self.client(port)
+        authenticated = self.handshake(client)
+        status, rejected = self.request(client, b"unrecognized-authentication-token")
+        self.assertEqual(status, 401)
+        self.assertNotEqual(
+            authenticated["X-Connection-ID"], rejected["X-Connection-ID"]
+        )
 
     def test_http3_rejects_ntlm_without_disabling_other_streams(self):
         backend, _, port, cert, error_log = self.start()

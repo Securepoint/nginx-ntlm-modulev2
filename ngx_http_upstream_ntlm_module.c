@@ -33,12 +33,10 @@
  *
  *  I4. Stale-credential eviction: when a new NTLM/Negotiate Authorization
  *      header arrives on a keep-alive client connection whose upstream session
- *      has already completed its handshake (c->requests >= 2), the old
- *      authenticated upstream session is evicted and closed.  This prevents
- *      a different identity from silently reusing a prior authenticated
- *      context.  The >= 2 threshold preserves the ability to complete the
- *      three-way NTLM handshake (Type-1/Type-2/Type-3) on a single TCP
- *      connection: c->requests == 1 when the Type-3 message arrives.
+ *      is not awaiting a continuation of that authentication scheme, the old
+ *      session is evicted and closed.  A new NTLM Type-1 or SPNEGO initial
+ *      token always starts a fresh session.  Response status alone never
+ *      determines whether negotiation has completed.
  *
  *  I5. Cached sessions belong to a client connection pointer AND number.
  *      Client-pool cleanup tracks this owner separately for each upstream
@@ -89,6 +87,12 @@ static void ngx_http_upstream_client_conn_cleanup(void *data);
 
 /* ── Data structures ─────────────────────────────────────────────────────── */
 
+typedef enum {
+    NGX_NTLM_AUTH_NONE,
+    NGX_NTLM_AUTH_NTLM,
+    NGX_NTLM_AUTH_NEGOTIATE
+} ngx_http_upstream_ntlm_auth_scheme_t;
+
 typedef struct {
     ngx_uint_t                          max_cached;
     ngx_uint_t                          max_requests;
@@ -111,7 +115,8 @@ typedef struct {
      * All releases MUST go through ngx_http_upstream_ntlm_item_release().
      */
     unsigned                            in_cache:1;
-    unsigned                            authenticated:1;
+    ngx_http_upstream_ntlm_auth_scheme_t auth_scheme;
+    unsigned                            awaiting_token:1;
 } ngx_http_upstream_ntlm_cache_t;
 
 typedef struct {
@@ -123,11 +128,14 @@ typedef struct {
 typedef struct {
     ngx_http_upstream_ntlm_srv_conf_t  *conf;
     ngx_http_upstream_t                *upstream;
+    ngx_pool_t                         *pool;
     void                               *data;
     ngx_connection_t                   *client_connection;
     unsigned                            cached:1;
     unsigned                            ntlm_init:1;
-    unsigned                            authenticated:1;
+    unsigned                            can_continue:1;
+    unsigned                            awaiting_token:1;
+    ngx_http_upstream_ntlm_auth_scheme_t auth_scheme;
     ngx_event_get_peer_pt               original_get_peer;
     ngx_event_free_peer_pt              original_free_peer;
     ngx_event_notify_peer_pt            original_notify;
@@ -215,7 +223,8 @@ ngx_http_upstream_ntlm_item_release(ngx_http_upstream_ntlm_cache_t *item)
     item->peer_connection = NULL;
     item->client_connection = NULL;
     item->client_connection_number = 0;
-    item->authenticated = 0;
+    item->auth_scheme = NGX_NTLM_AUTH_NONE;
+    item->awaiting_token = 0;
     ngx_queue_remove(&item->queue);
     ngx_queue_insert_head(&item->conf->free, &item->queue);
 }
@@ -268,6 +277,225 @@ ngx_http_upstream_init_ntlm(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     return NGX_OK;
 }
 
+/* ── Authentication exchange tracking ──────────────────────────────────── */
+
+static ngx_int_t
+ngx_http_upstream_ntlm_auth_token(ngx_http_request_t *r,
+    ngx_http_upstream_ntlm_peer_data_t *hnpd, ngx_str_t *auth)
+{
+    ngx_str_t  encoded, decoded;
+    size_t     scheme_len;
+
+    scheme_len = hnpd->auth_scheme == NGX_NTLM_AUTH_NTLM
+                 ? sizeof("NTLM") - 1 : sizeof("Negotiate") - 1;
+    encoded.data = auth->data + scheme_len;
+    encoded.len = auth->len - scheme_len;
+    while (encoded.len && encoded.data[0] == ' ') {
+        encoded.data++;
+        encoded.len--;
+    }
+
+    if (encoded.len == 0) {
+        return NGX_OK;
+    }
+
+    decoded.data = ngx_pnalloc(r->pool, ngx_base64_decoded_length(encoded.len));
+    if (decoded.data == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_decode_base64(&decoded, &encoded) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "ntlm: invalid authentication token, not reusing session");
+        return NGX_OK;
+    }
+
+    if (decoded.len >= 12
+        && ngx_memcmp(decoded.data, "NTLMSSP\0", 8) == 0)
+    {
+        if (decoded.data[9] == 0 && decoded.data[10] == 0
+            && decoded.data[11] == 0)
+        {
+            hnpd->awaiting_token = decoded.data[8] == 1;
+            hnpd->can_continue = decoded.data[8] == 3;
+        }
+    } else if (hnpd->auth_scheme == NGX_NTLM_AUTH_NEGOTIATE && decoded.len) {
+        /*
+         * GSS InitialContextToken (application tag 0) starts a new exchange.
+         * Only a NegTokenResp (context tag 1) can continue a SPNEGO exchange.
+         * It still requires a matching upstream challenge on this connection.
+         */
+        hnpd->can_continue = decoded.data[0] == 0xa1;
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_upstream_ntlm_der_value(ngx_str_t *input, u_char tag, ngx_str_t *value)
+{
+    u_char  *p, *last;
+    size_t   len, n;
+
+    p = input->data;
+    last = p + input->len;
+    if (input->len < 2 || *p++ != tag) {
+        return NGX_ERROR;
+    }
+    len = *p++;
+    if (len & 0x80) {
+        n = len & 0x7f;
+        if (n == 0 || n > sizeof(size_t) || n > (size_t) (last - p)) {
+            return NGX_ERROR;
+        }
+        len = 0;
+        while (n--) {
+            len = (len << 8) | *p++;
+        }
+    }
+    if (len > (size_t) (last - p)) {
+        return NGX_ERROR;
+    }
+    value->data = p;
+    value->len = len;
+    input->data = p + len;
+    input->len = last - input->data;
+    return NGX_OK;
+}
+
+static ngx_uint_t
+ngx_http_upstream_ntlm_challenge_pending(ngx_str_t token)
+{
+    ngx_str_t  value, state;
+
+    if (token.len == 0) {
+        return 0;
+    }
+    if (token.data[0] != 0xa1) {
+        return token.len >= 12
+               && ngx_memcmp(token.data, "NTLMSSP\0\2\0\0\0", 12) == 0;
+    }
+    if (ngx_http_upstream_ntlm_der_value(&token, 0xa1, &value) != NGX_OK
+        || token.len != 0
+        || ngx_http_upstream_ntlm_der_value(&value, 0x30, &token) != NGX_OK
+        || value.len != 0 || token.len == 0)
+    {
+        return 0;
+    }
+    if (token.data[0] != 0xa0) {
+        return 1; /* negState is optional; the response token continues exchange. */
+    }
+    if (ngx_http_upstream_ntlm_der_value(&token, 0xa0, &value) != NGX_OK
+        || ngx_http_upstream_ntlm_der_value(&value, 0x0a, &state) != NGX_OK
+        || value.len != 0 || state.len != 1)
+    {
+        return 0;
+    }
+    /* accept-incomplete or request-mic, not accept-completed or reject. */
+    return state.data[0] == 1 || state.data[0] == 3;
+}
+
+static ngx_int_t
+ngx_http_upstream_ntlm_challenge_token(ngx_http_upstream_ntlm_peer_data_t *hndp,
+    ngx_str_t value, ngx_str_t scheme)
+{
+    u_char  *p, *start, *last;
+    ngx_str_t encoded, decoded;
+
+    p = value.data;
+    last = p + value.len;
+    while (p < last) {
+        while (p < last && (*p == ' ' || *p == '\t' || *p == ',')) {
+            p++;
+        }
+        start = p;
+        if ((size_t) (last - p) > scheme.len
+            && ngx_strncasecmp(p, scheme.data, scheme.len) == 0
+            && (p[scheme.len] == ' ' || p[scheme.len] == '\t'))
+        {
+            p += scheme.len;
+            while (p < last && (*p == ' ' || *p == '\t')) {
+                p++;
+            }
+            if (p < last && *p != ',') {
+                encoded.data = p;
+                while (p < last && *p != ',' && *p != ' ' && *p != '\t') {
+                    p++;
+                }
+                encoded.len = p - encoded.data;
+                decoded.data = ngx_pnalloc(hndp->pool,
+                                          ngx_base64_decoded_length(encoded.len));
+                if (decoded.data == NULL) {
+                    return NGX_ERROR;
+                }
+                if (ngx_decode_base64(&decoded, &encoded) != NGX_OK) {
+                    ngx_log_error(NGX_LOG_ERR, hndp->client_connection->log, 0,
+                                  "ntlm: invalid upstream authentication token");
+                    return 0;
+                }
+                return ngx_http_upstream_ntlm_challenge_pending(decoded);
+            }
+        }
+        p = start;
+        while (p < last && *p != ',') {
+            if (*p++ == '"') {
+                while (p < last) {
+                    if (*p == '\\' && p + 1 < last) {
+                        p += 2;
+                    } else if (*p++ == '"') {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+static ngx_int_t
+ngx_http_upstream_ntlm_has_challenge(ngx_http_upstream_ntlm_peer_data_t *hndp)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *header;
+    ngx_uint_t       i;
+    ngx_int_t        pending;
+    ngx_str_t        scheme;
+
+    if (hndp->auth_scheme == NGX_NTLM_AUTH_NTLM) {
+        ngx_str_set(&scheme, "NTLM");
+    } else {
+        ngx_str_set(&scheme, "Negotiate");
+    }
+
+    part = &hndp->upstream->headers_in.headers.part;
+    header = part->elts;
+    for (i = 0; /* void */; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            header = part->elts;
+            i = 0;
+        }
+        if (header[i].key.len != sizeof("WWW-Authenticate") - 1
+            || ngx_strncasecmp(header[i].key.data,
+                               (u_char *) "WWW-Authenticate",
+                               sizeof("WWW-Authenticate") - 1) != 0)
+        {
+            continue;
+        }
+        pending = ngx_http_upstream_ntlm_challenge_token(hndp, header[i].value,
+                                                        scheme);
+        if (pending != 0) {
+            return pending;
+        }
+    }
+
+    return 0;
+}
+
 /* ── Per-request peer initialisation ────────────────────────────────────── */
 
 static ngx_int_t
@@ -298,7 +526,9 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
 
     hnpd->ntlm_init = 0;
     hnpd->cached    = 0;
-    hnpd->authenticated = 0;
+    hnpd->auth_scheme = NGX_NTLM_AUTH_NONE;
+    hnpd->can_continue = 0;
+    hnpd->awaiting_token = 0;
 
     if (r->headers_in.authorization != NULL) {
         auth = r->headers_in.authorization->value;
@@ -317,11 +547,18 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
             ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "ntlm: authorization header detected");
             hnpd->ntlm_init = 1;
+            hnpd->auth_scheme =
+                ngx_strncasecmp(auth.data, (u_char *) "NTLM", 4) == 0
+                ? NGX_NTLM_AUTH_NTLM : NGX_NTLM_AUTH_NEGOTIATE;
+            if (ngx_http_upstream_ntlm_auth_token(r, hnpd, &auth) != NGX_OK) {
+                return NGX_ERROR;
+            }
         }
     }
 
     hnpd->conf              = hncf;
     hnpd->upstream          = r->upstream;
+    hnpd->pool              = r->pool;
     hnpd->data              = r->upstream->peer.data;
     hnpd->client_connection = r->connection;
 
@@ -390,7 +627,9 @@ ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data)
         }
 
         if (ngx_current_msec - c->start_time > hndp->conf->time
-            || (hndp->ntlm_init && item->authenticated))
+            || (hndp->ntlm_init
+                && (!hndp->can_continue || !item->awaiting_token
+                    || hndp->auth_scheme != item->auth_scheme)))
         {
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
                            "ntlm: retiring expired or reauthenticated "
@@ -406,7 +645,10 @@ ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data)
          * so ownership fields and queue movement stay atomic and consistent
          * (invariant I1).
          */
-        hndp->authenticated = item->authenticated;
+        if (!hndp->ntlm_init) {
+            hndp->auth_scheme = item->auth_scheme;
+            hndp->awaiting_token = item->awaiting_token;
+        }
         ngx_http_upstream_ntlm_item_release(item);
 
         hndp->cached = 1;
@@ -480,6 +722,7 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
     ngx_http_upstream_t                 *u;
     ngx_pool_cleanup_t                  *cln;
     ngx_http_upstream_ntlm_cleanup_t    *cleanup;
+    ngx_int_t                            awaiting_token;
 
     u = hndp->upstream;
     c = pc->connection;
@@ -526,6 +769,13 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
         goto invalid;
     }
 
+    awaiting_token = ngx_http_upstream_ntlm_has_challenge(hndp);
+    if (awaiting_token == NGX_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, pc->log, 0,
+                      "ntlm: failed to allocate challenge tracking");
+        goto invalid;
+    }
+
     /* Acquire a free slot, evicting the oldest entry if the cache is full. */
 
     if (ngx_queue_empty(&hndp->conf->free)) {
@@ -561,9 +811,9 @@ ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
     item->client_connection = hndp->client_connection;
     item->client_connection_number = hndp->client_connection->number;
     item->in_cache          = 1;
-    /* A 401 challenge continues negotiation regardless of prior request count. */
-    item->authenticated = hndp->authenticated
-                          || u->headers_in.status_n != NGX_HTTP_UNAUTHORIZED;
+    item->auth_scheme = hndp->auth_scheme;
+    item->awaiting_token = hndp->awaiting_token
+                           || awaiting_token;
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
                    "ntlm: caching upstream connection %p for client %p",

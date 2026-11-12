@@ -19,7 +19,7 @@ connection semantics that are not compatible with multiplexed protocols.
 
 - **Session-hijack via cleanup-OOM (Critical)** — If `ngx_pool_cleanup_add()` returns NULL the upstream connection is no longer cached. Previously the connection was inserted into the cache with a stale `client_connection` pointer that nginx might later recycle for a different client, allowing `get_ntlm_peer` to hand an already-authenticated session to the wrong client (ABA pointer-reuse attack).
 
-- **Stale-credential reuse (High)** — When a keep-alive client connection sends new `NTLM`/`Negotiate` credentials after the upstream stops returning 401 challenges, the old authenticated upstream session is evicted and closed, forcing a fresh negotiation. Challenge responses keep the connection pinned throughout multi-round authentication, independently of prior unauthenticated requests.
+- **Stale-credential reuse (High)** — New NTLM Type-1 or SPNEGO initial tokens always start a fresh upstream connection. NTLM Type-3 can continue a pending Type-1 exchange; SPNEGO response tokens require a matching, token-bearing `WWW-Authenticate` challenge. Switching authentication schemes also retires the old connection. HTTP response status and request counts are not treated as proof of authentication; credential validation remains the backend's responsibility.
 
 - **Atomic item release** — A dedicated `ngx_http_upstream_ntlm_item_release()` helper is the single canonical code path for returning a cache item to the free list. It atomically clears `in_cache`, `peer_connection`, and `client_connection` before any queue operation, preventing any concurrent handler from operating on a partially-released item.
 
@@ -133,6 +133,10 @@ Protocol regressions use real NTLM messages and a local credential verifier,
 plus certificate-verified HTTP/3 and cleartext HTTP/2 connections. They cover challenge-first
 negotiation, credential replacement, shared-cache pinning, age limits and
 per-upstream protocol rejection. Test credentials are synthetic and temporary.
+Negotiation regressions cover real NTLM and NTLM-over-SPNEGO exchanges, including
+intermediate 200/403/429/500 responses, restarting incomplete handshakes and
+switching schemes. Kerberos authentication requires a separate realm integration
+test; the module treats SPNEGO mechanism payloads as opaque.
 
 To include the cleanup-allocation failure regression, build a second nginx
 binary with `--with-cc-opt="-DNGX_NTLM_TEST_CLEANUP_NULL"` and run:
