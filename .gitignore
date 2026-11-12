@@ -2,3 +2,5 @@
 compile_commands.json
 t/servroot
 t/*/node_modules
+t/__pycache__/
+.venv/
