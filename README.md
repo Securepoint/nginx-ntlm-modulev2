@@ -52,8 +52,8 @@ remain the backend's responsibility.
 ## Investigation of the earlier fixes
 
 The earlier commits are evidence and regression references, **not ancestors of
-this implementation**. This branch contains one new commit on
-`main`; behavioral test fixtures are reused without their commit history.
+this implementation**. The redesign was introduced as one new commit directly
+on `main`; behavioral test fixtures are reused without their commit history.
 
 | Earlier change | Problem it attempted to address | Assessment |
 | --- | --- | --- |
