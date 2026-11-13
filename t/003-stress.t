@@ -155,9 +155,9 @@ Stress a single pinned session with 10 pipelined requests.
 \[error\]
 
 
-=== TEST 5: Simultaneous independent sessions should not cross-contaminate
-Two sequential session setups using different tokens must keep responses isolated
-to their own session token.
+=== TEST 5: Sequential credential replacement on one connection
+Changing credentials on a single pipelined client connection must replace the
+previous session token.
 --- http_config
     upstream backend {
         server localhost:19841;

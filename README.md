@@ -35,6 +35,11 @@ SPNEGO responses can continue only a pending exchange. Neither request counts
 nor HTTP status prove that authentication completed; mechanism credentials
 remain the backend's responsibility.
 
+Bare or invalid matching challenges do not hide later token-bearing challenges,
+whether combined in one header or sent as separate headers. The first valid
+matching continuation or explicit SPNEGO completion/rejection determines the
+pending state.
+
 **Behavioral boundaries:**
 
 - Sessions are deliberately isolated by proxy configuration, not just upstream
@@ -378,6 +383,8 @@ accounting, idle/age/request retirement and TLS lifecycle with default and selec
 event backends. Protocol tests use real NTLM/SPNEGO exchanges and
 certificate-verified TLS 1.2/1.3, shared upstream zones with SSL session reuse on,
 HTTP/2 and HTTP/3. Credentials are synthetic and temporary.
+Two simultaneously connected, authenticated clients are also checked for
+separate retained backend sockets while an anonymous third client is rejected.
 
 Parallel ownership tests use SSI subrequests to the same proxy configuration.
 Backend barriers establish overlap, and nginx debug traces establish upstream

@@ -429,7 +429,13 @@ ngx_http_ntlm_challenge(ngx_http_ntlm_peer_t *pd)
             if (token == NGX_ERROR) {
                 return NGX_ERROR;
             }
-            return token == NGX_NTLM_CHALLENGE_TOKEN;
+            if (token == NGX_NTLM_CHALLENGE_TOKEN) {
+                return 1;
+            }
+            if (token == NGX_NTLM_COMPLETE_TOKEN) {
+                return 0;
+            }
+            /* Bare or invalid entries must not hide a later challenge. */
         }
     }
     return seen ? 0 : NGX_DECLINED;

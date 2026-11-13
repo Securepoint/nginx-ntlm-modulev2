@@ -2,6 +2,13 @@
 
 This document describes the steps to follow in order to build this modules using docker 
 
+The Alpine static and dynamic builds download nginx over HTTPS and verify the
+archive against a pinned SHA-256 before extraction. The default checksum is for
+nginx 1.28.0, obtained from the official `nginx/nginx` GitHub release archive.
+When changing the nginx version, update its matching checksum from a trusted
+release source; the build fails if the archive does not match. The
+`NGINX_SHA256` build argument can override the checksum for a verified archive.
+
 ## alpine - static
 
 ```bash

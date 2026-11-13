@@ -49,6 +49,7 @@ class NTLMHandler(BaseHTTPRequestHandler):
         self.server.requests.append(self.path)
         authorization = self.headers.get("Authorization")
         status, challenge = 200, None
+        extra_challenge = None
         if not authorization:
             if not self.context or not self.context.complete:
                 status, challenge = 401, "NTLM"
@@ -89,6 +90,22 @@ class NTLMHandler(BaseHTTPRequestHandler):
             layout = self.headers.get("X-Audit-Challenge-Layout")
             if layout == "combined":
                 challenge = 'Basic realm="audit, escaped \\" realm", ' + challenge
+            elif layout in (
+                "duplicate-combined", "duplicate-separate",
+                "invalid-combined", "invalid-separate",
+                "reject-combined", "reject-separate",
+            ):
+                prefix = challenge.split(" ", 1)[0]
+                if layout.startswith("invalid-"):
+                    prefix += " !!!"
+                elif layout.startswith("reject-"):
+                    prefix += " " + base64.b64encode(
+                        b"\xa1\x07\x30\x05\xa0\x03\x0a\x01\x02"
+                    ).decode()
+                if layout.endswith("-combined"):
+                    challenge = prefix + ", " + challenge
+                else:
+                    extra_challenge = prefix
             elif layout == "quoted-only":
                 challenge = 'Basic realm="audit, ' + challenge + '"'
             elif layout == "different-scheme":
@@ -151,6 +168,8 @@ class NTLMHandler(BaseHTTPRequestHandler):
         if challenge:
             if self.headers.get("X-Audit-Challenge-Layout") == "separate":
                 self.send_header("WWW-Authenticate", 'Basic realm="audit"')
+            if extra_challenge:
+                self.send_header("WWW-Authenticate", extra_challenge)
             self.send_header("WWW-Authenticate", challenge)
         self.end_headers()
         self.wfile.write(body)
@@ -396,6 +415,22 @@ http {{
 
 
 class ProtocolTests(ProtocolTestCase):
+    def test_two_live_clients_retain_separate_authenticated_sockets(self):
+        backend, port, _, _, _ = self.start()
+        alice, bob = self.client(port), self.client(port)
+        alice_id = self.handshake(alice)["X-Connection-ID"]
+        bob_id = self.handshake(bob)["X-Connection-ID"]
+        self.assertNotEqual(alice_id, bob_id)
+
+        for _ in range(3):
+            for client, expected_id in ((alice, alice_id), (bob, bob_id)):
+                status, headers = self.request(client)
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["X-Connection-ID"], expected_id)
+
+        self.assertEqual(self.request(self.client(port))[0], 401)
+        self.assertFalse(backend.errors)
+
     def test_challenge_first_and_preemptive_ntlm_keep_the_handshake_socket(self):
         for shared, challenge_first in [(False, True), (True, False), (True, True), (None, True)]:
             with self.subTest(shared=shared, challenge_first=challenge_first):
@@ -597,6 +632,47 @@ class ProtocolTests(ProtocolTestCase):
             ids.append(final["X-Connection-ID"])
         self.assertNotEqual(ids[0], ids[1])
         self.assertFalse(backend.errors)
+
+    def test_later_matching_challenges_are_not_hidden_by_bare_or_invalid_entries(self):
+        backend, port, _, _, _ = self.start()
+        for scheme in ("NTLM", "Negotiate"):
+            for layout in (
+                "duplicate-combined", "duplicate-separate",
+                "invalid-combined", "invalid-separate",
+            ):
+                with self.subTest(scheme=scheme, layout=layout):
+                    client = self.client(port)
+                    context = spnego.client(
+                        USERNAME, PASSWORD, protocol=scheme.lower()
+                    )
+                    status, first = self.request(
+                        client, context.step(), scheme=scheme, challenge_layout=layout
+                    )
+                    self.assertEqual(status, 401)
+                    message = context.step(base64.b64decode(
+                        backend.challenges[-1].split(" ", 1)[1]
+                    ))
+                    status, final = self.request(client, message, scheme=scheme)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(first["X-Connection-ID"], final["X-Connection-ID"])
+        self.assertFalse(backend.errors)
+
+    def test_spnego_rejection_before_a_challenge_blocks_continuation(self):
+        backend, port, _, _, _ = self.start()
+        for layout in ("reject-combined", "reject-separate"):
+            with self.subTest(layout=layout):
+                client = self.client(port)
+                context = spnego.client(USERNAME, PASSWORD, protocol="negotiate")
+                status, first = self.request(
+                    client, context.step(), scheme="Negotiate", challenge_layout=layout
+                )
+                self.assertEqual(status, 401)
+                message = context.step(base64.b64decode(
+                    backend.challenges[-1].split(" ", 1)[1]
+                ))
+                status, final = self.request(client, message, scheme="Negotiate")
+                self.assertEqual(status, 401)
+                self.assertNotEqual(first["X-Connection-ID"], final["X-Connection-ID"])
 
     def test_completed_spnego_token_does_not_authorize_another_continuation(self):
         backend, port, _, _, _ = self.start()

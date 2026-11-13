@@ -1,6 +1,7 @@
 FROM alpine:3.20 AS builder
 
 ARG NGINX_VERSION=1.28.0
+ARG NGINX_SHA256=c6b5c6b086c0df9d3ca3ff5e084c1d0ef909e6038279c71c1c3e985f576ff76a
 
 # install build tools
 RUN set -x \
@@ -24,7 +25,12 @@ RUN set -x \
 WORKDIR /build 
 
 # download nginx 
-RUN curl -OL http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
+RUN test -n "$NGINX_SHA256" \
+    && curl --fail --show-error --location \
+        --proto '=https' --proto-redir '=https' \
+        "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+        -o "nginx-${NGINX_VERSION}.tar.gz" \
+    && echo "${NGINX_SHA256}  nginx-${NGINX_VERSION}.tar.gz" | sha256sum -c - \
     && tar -xvzf nginx-${NGINX_VERSION}.tar.gz && rm nginx-${NGINX_VERSION}.tar.gz \
     && git clone https://github.com/Securepoint/nginx-ntlm-modulev2.git nginx-ntlm-modulev2
 
