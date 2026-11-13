@@ -353,6 +353,31 @@ producing a `.so`; retain the other build options required by your target nginx.
 Non-compatible HTTP-only static builds remain supported. The repaired module
 does not require disabling `proxy_ssl_session_reuse`.
 
+### Platform build helpers
+
+The `utils/build_{linux,macos,win}_{download,configure,make}.sh` helpers use
+shared source pins in `utils/build_common.sh`: nginx 1.30.6, PCRE2 10.49,
+OpenSSL 3.5.9 (LTS), and zlib 1.4. Downloads use HTTPS-only redirects and
+verify pinned SHA-256 digests from the projects' official GitHub release assets
+before extraction. Update each version and its checksum together.
+
+Run the helpers with Bash from a writable build directory, keeping the same
+working directory for all three stages. Sources are extracted there; the module
+path is resolved from the helper's location, regardless of the checkout name.
+For example:
+
+```bash
+bash /path/to/nginx-ntlm-modulev2/utils/build_linux_download.sh
+bash /path/to/nginx-ntlm-modulev2/utils/build_linux_configure.sh
+bash /path/to/nginx-ntlm-modulev2/utils/build_linux_make.sh
+```
+
+Install a C build toolchain, Make, Perl, curl, tar, and either `sha256sum` or
+`shasum`. On Windows, use an MSYS2 Bash environment with the Visual Studio 2022
+x64 tools available, plus a compatible Windows Perl and NASM for OpenSSL.
+The Windows make helper prints the native `nmake /f objs/Makefile` command;
+it does not execute it. macOS requires the Xcode command-line tools.
+
 ## Tests
 
 The tests need Node.js, Perl, Python 3 and the OpenSSL CLI. For the Python suite,

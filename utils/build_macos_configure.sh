@@ -1,6 +1,8 @@
 #!/bin/bash
 
-cd nginx-1.19.3/
+source "$(dirname -- "${BASH_SOURCE[0]}")/build_common.sh"
+
+cd "nginx-${NGINX_VERSION}"
 
 ./configure --with-debug \
             --prefix= \
@@ -8,8 +10,8 @@ cd nginx-1.19.3/
             --pid-path=logs/nginx.pid \
             --http-log-path=logs/access.log \
             --error-log-path=logs/error.log \
-            --with-pcre=../pcre-8.44 \
-            --with-zlib=../zlib-1.2.11 \
+            --with-pcre="../pcre2-${PCRE2_VERSION}" \
+            --with-zlib="../zlib-${ZLIB_VERSION}" \
             --with-http_v2_module \
             --with-http_realip_module \
             --with-http_addition_module \
@@ -26,8 +28,8 @@ cd nginx-1.19.3/
             --with-http_slice_module \
             --with-mail \
             --with-stream \
-            --with-openssl=../openssl-1.1.1h \
+            --with-openssl="../openssl-${OPENSSL_VERSION}" \
             --with-http_ssl_module \
             --with-mail_ssl_module \
             --with-stream_ssl_module \
-            --add-module=../nginx-ntlm-modulev2
+            --add-module="$NTLM_MODULE_DIR"
