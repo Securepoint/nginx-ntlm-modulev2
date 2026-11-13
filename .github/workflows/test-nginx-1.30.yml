@@ -26,6 +26,10 @@ jobs:
             source: master
             nginx-version: master
 
+    env:
+      # nginx 1.26.3 QUIC byte strings trigger a GCC 15 warning.
+      NGINX_CC_OPT: ${{ matrix.nginx-version == '1.26.3' && '-Wno-error=unterminated-string-initialization' || '' }}
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -69,7 +73,8 @@ jobs:
         run: |
           cd "$RUNNER_TEMP/nginx-src"
           ./auto/configure --prefix="$RUNNER_TEMP/nginx" --add-module="$GITHUB_WORKSPACE" \
-            --with-debug --with-select_module --with-http_ssl_module --with-http_v2_module --with-http_v3_module
+            --with-debug --with-select_module --with-http_ssl_module --with-http_v2_module --with-http_v3_module \
+            --with-cc-opt="$NGINX_CC_OPT"
           make -j"$(nproc)"
           make install
 
@@ -79,7 +84,7 @@ jobs:
           ./auto/configure --prefix="$RUNNER_TEMP/nginx-cleanup-null" \
             --add-module="$GITHUB_WORKSPACE" \
             --with-debug --with-select_module --with-http_ssl_module --with-http_v2_module --with-http_v3_module \
-            --with-cc-opt="-DNGX_NTLM_TEST_CLEANUP_NULL"
+            --with-cc-opt="$NGINX_CC_OPT -DNGX_NTLM_TEST_CLEANUP_NULL"
           make -j"$(nproc)"
           make install
 
@@ -95,7 +100,8 @@ jobs:
           cd "$RUNNER_TEMP/nginx-src"
           ./auto/configure --builddir=objs-dynamic --prefix="$RUNNER_TEMP/nginx-dynamic" \
             --with-compat --add-dynamic-module="$GITHUB_WORKSPACE" \
-            --with-debug --with-select_module --with-http_ssl_module --with-http_v2_module --with-http_v3_module
+            --with-debug --with-select_module --with-http_ssl_module --with-http_v2_module --with-http_v3_module \
+            --with-cc-opt="$NGINX_CC_OPT"
           make -j"$(nproc)"
           export TEST_NGINX_BINARY="$RUNNER_TEMP/nginx-src/objs-dynamic/nginx"
           export TEST_NGINX_MODULE="$RUNNER_TEMP/nginx-src/objs-dynamic/ngx_http_upstream_ntlm_module.so"
