@@ -49,6 +49,31 @@ remain the backend's responsibility.
 - Failed or retry-rejected pinned sockets are closed. Normal nginx retry policy
   can select a replacement, but authentication state cannot move to it.
 
+### Authorization header passthrough
+
+The module classifies authentication using the client's incoming `Authorization`
+header, not the outgoing header evaluated by `proxy_set_header`. On an `ntlm`
+upstream, preserve that header unchanged; ordinary proxy header passthrough is
+the supported configuration.
+
+Do not inject NTLM/Negotiate credentials from another header or variable, for
+example with `proxy_set_header Authorization $http_x_ntlm_authorization;`.
+If the incoming `Authorization` header is absent, the module treats the request
+as anonymous even though the backend receives credentials. With shared upstream
+keepalive, the authenticated socket can then enter the shared pool and serve a
+different client's request under the previous client's backend identity.
+This requires neither a shared downstream connection nor an attacker-controlled
+intermediary: separate downstream connections can reuse a shared upstream socket.
+Rewriting or suppressing credentials can also prevent the module from correctly
+detecting credential changes and authentication continuations.
+
+Authorization rewriting is not currently rejected by configuration validation.
+This is a usage restriction, not an implemented security fix. Integrations that
+require rewriting need the module to track the effective outgoing credentials
+before peer selection; disabling shared keepalive alone does not repair
+credential-change tracking. Ordinary unchanged Authorization passthrough does
+not have this header-classification mismatch.
+
 ### Connection identity and forward proxies
 
 The ownership key is the downstream connection plus the upstream/proxy
