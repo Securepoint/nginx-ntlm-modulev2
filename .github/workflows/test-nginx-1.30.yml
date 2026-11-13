@@ -16,12 +16,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - label: "1.26.3"
+            source: release
+            nginx-version: "1.26.3"
           - label: "1.30.0"
             source: release
             nginx-version: "1.30.0"
           - label: master
             source: master
             nginx-version: master
+
+    env:
+      # nginx 1.26.3 QUIC byte strings trigger a GCC 15 warning.
+      NGINX_CC_OPT: ${{ matrix.nginx-version == '1.26.3' && '-Wno-error=unterminated-string-initialization' || '' }}
 
     steps:
       - name: Check out repository
@@ -37,7 +44,13 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential curl perl cpanminus libpcre2-dev zlib1g-dev
+          sudo apt-get install -y build-essential curl perl cpanminus libpcre2-dev zlib1g-dev libssl-dev python3-venv
+
+      - name: Install protocol test dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/protocol-tests"
+          "$RUNNER_TEMP/protocol-tests/bin/pip" install -r t/requirements.txt
+          echo "$RUNNER_TEMP/protocol-tests/bin" >> "$GITHUB_PATH"
 
       - name: Install backend dependencies
         run: npm ci --prefix "$GITHUB_WORKSPACE/t/backend"
@@ -59,11 +72,48 @@ jobs:
       - name: Build nginx with module
         run: |
           cd "$RUNNER_TEMP/nginx-src"
-          ./auto/configure --prefix="$RUNNER_TEMP/nginx" --add-module="$GITHUB_WORKSPACE"
+          ./auto/configure --prefix="$RUNNER_TEMP/nginx" --add-module="$GITHUB_WORKSPACE" \
+            --with-debug --with-select_module --with-http_ssl_module --with-http_v2_module --with-http_v3_module \
+            --with-cc-opt="$NGINX_CC_OPT"
+          make -j"$(nproc)"
+          make install
+
+      - name: Build cleanup-allocation fault-injection binary
+        run: |
+          cd "$RUNNER_TEMP/nginx-src"
+          ./auto/configure --prefix="$RUNNER_TEMP/nginx-cleanup-null" \
+            --add-module="$GITHUB_WORKSPACE" \
+            --with-debug --with-select_module --with-http_ssl_module --with-http_v2_module --with-http_v3_module \
+            --with-cc-opt="$NGINX_CC_OPT -DNGX_NTLM_TEST_CLEANUP_NULL"
           make -j"$(nproc)"
           make install
 
       - name: Run test suite
         run: |
           export PATH="$RUNNER_TEMP/nginx/sbin:$PATH"
+          export TEST_NGINX_CLEANUP_NULL_BINARY="$RUNNER_TEMP/nginx-cleanup-null/sbin/nginx"
           prove -r "$GITHUB_WORKSPACE/t"
+          python3 -m unittest discover -s "$GITHUB_WORKSPACE/t" -p 'test_*.py'
+
+      - name: Build and test compatible dynamic module
+        run: |
+          cd "$RUNNER_TEMP/nginx-src"
+          ./auto/configure --builddir=objs-dynamic --prefix="$RUNNER_TEMP/nginx-dynamic" \
+            --with-compat --add-dynamic-module="$GITHUB_WORKSPACE" \
+            --with-debug --with-select_module --with-http_ssl_module --with-http_v2_module --with-http_v3_module \
+            --with-cc-opt="$NGINX_CC_OPT"
+          make -j"$(nproc)"
+          export TEST_NGINX_BINARY="$RUNNER_TEMP/nginx-src/objs-dynamic/nginx"
+          export TEST_NGINX_MODULE="$RUNNER_TEMP/nginx-src/objs-dynamic/ngx_http_upstream_ntlm_module.so"
+          cd "$GITHUB_WORKSPACE"
+          python3 -m unittest discover -s t -p 'test_*.py'
+
+      - name: Reject unsafe SSL-less compatible builds
+        run: |
+          cd "$RUNNER_TEMP/nginx-src"
+          if ./auto/configure --builddir=objs-unsafe --with-compat \
+            --add-dynamic-module="$GITHUB_WORKSPACE" > unsafe-build.log 2>&1; then
+            echo "Unsafe compatible module configuration unexpectedly succeeded"
+            exit 1
+          fi
+          grep -F 'NTLM compatible modules require --with-http_ssl_module' unsafe-build.log

@@ -1,893 +1,840 @@
 /*
- * ngx_http_upstream_ntlm_module.c — nginx NTLM upstream module v2
+ * Connection-bound NTLM/Negotiate upstream sessions for nginx >= 1.26.3.
  *
- * Binds an upstream connection to a client connection for the duration of an
- * NTLM/Negotiate authentication handshake and keeps the upstream connection
- * alive across subsequent requests from the same client.
- *
- * Targets nginx >= 1.25.  Does not support older nginx releases.
- *
- * ── Security invariants ────────────────────────────────────────────────────
- *
- *  I1. in_cache is the authoritative ownership flag for a cache item.
- *      in_cache == 1  →  item lives in conf->cache and owns peer_connection.
- *      in_cache == 0  →  item lives in conf->free  (idle slot, no connection).
- *      Every code path that moves an item out of conf->cache MUST call
- *      ngx_http_upstream_ntlm_item_release(), which atomically clears
- *      in_cache, peer_connection, and client_connection before any queue
- *      operation, so that any concurrently running handler sees a consistent
- *      state and exits early.
- *
- *  I2. c->read->data (not c->data) stores the cache item while an upstream
- *      connection is idle.  nginx's ngx_http_upstream_handler() requires
- *      c->data to be the request pointer; overwriting it with the cache item
- *      causes a segfault on nginx >= 1.25.  c->read->data is restored to c
- *      (the connection) before the connection is returned to upstream core.
- *
- *  I3. OOM guard: if ngx_pool_cleanup_add() returns NULL the upstream
- *      connection MUST NOT be inserted into the cache.  Without a cleanup
- *      handler the cached item would retain a stale client_connection pointer
- *      that nginx may later recycle for a different client, allowing
- *      get_ntlm_peer to hand an already-authenticated upstream session to the
- *      wrong client (ABA pointer-reuse session hijack).
- *
- *  I4. Stale-credential eviction: when a new NTLM/Negotiate Authorization
- *      header arrives on a keep-alive client connection whose upstream session
- *      has already completed its handshake (c->requests >= 2), the old
- *      authenticated upstream session is evicted and closed.  This prevents
- *      a different identity from silently reusing a prior authenticated
- *      context.  The >= 2 threshold preserves the ability to complete the
- *      three-way NTLM handshake (Type-1/Type-2/Type-3) on a single TCP
- *      connection: c->requests == 1 when the Type-3 message arrives.
- *
- * ── Configuration directives (upstream context) ────────────────────────────
- *
- *   ntlm [connections]     max cached upstream connections (default: 100)
- *   ntlm_timeout timeout   idle-connection timeout          (default: 60s)
- *   ntlm_time time         max wall-clock connection age    (default: 1h)
- *   ntlm_requests number   max requests per connection      (default: 1000)
+ * A client-pool cleanup owns each idle session directly.  The upstream LRU
+ * only bounds idle capacity; it never supplies reusable ownership records.
+ * Active sockets belong to upstream core, idle sockets to their client owner.
+ * Event data always remains the connection pointer.
  */
 
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
 
-/* ── Forward declarations ─────────────────────────────────────────────────── */
-
-static ngx_int_t ngx_http_upstream_init_ntlm(ngx_conf_t *cf,
-    ngx_http_upstream_srv_conf_t *us);
-static ngx_int_t ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
-    ngx_http_upstream_srv_conf_t *us);
-static ngx_int_t ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc,
-    void *data);
-static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
-    void *data, ngx_uint_t state);
-
-static void ngx_http_upstream_ntlm_dummy_handler(ngx_event_t *ev);
-static void ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev);
-static void ngx_http_upstream_ntlm_close(ngx_connection_t *c);
-static void ngx_http_upstream_ntlm_notify_peer(ngx_peer_connection_t *pc,
-    void *data, ngx_uint_t type);
-
-#if (NGX_HTTP_SSL)
-static ngx_int_t ngx_http_upstream_ntlm_set_session(ngx_peer_connection_t *pc,
-    void *data);
-static void ngx_http_upstream_ntlm_save_session(ngx_peer_connection_t *pc,
-    void *data);
+/* A compatible .so must include SSL wrappers if the host may use TLS peers. */
+#if (NGX_COMPAT && !NGX_HTTP_SSL)
+#error "NTLM compatible modules require --with-http_ssl_module"
 #endif
 
-static void *ngx_http_upstream_ntlm_create_conf(ngx_conf_t *cf);
-static char *ngx_http_upstream_ntlm_init_main_conf(ngx_conf_t *cf, void *conf);
-static char *ngx_http_upstream_ntlm_directive(ngx_conf_t *cf,
-    ngx_command_t *cmd, void *conf);
-static void ngx_http_upstream_client_conn_cleanup(void *data);
+typedef enum {
+    NGX_NTLM_NO_AUTH,
+    NGX_NTLM_OTHER_AUTH,
+    NGX_NTLM_AUTH,
+    NGX_NTLM_NEGOTIATE
+} ngx_http_ntlm_scheme_t;
 
-/* ── Data structures ─────────────────────────────────────────────────────── */
-
-typedef struct {
-    ngx_uint_t                          max_cached;
-    ngx_uint_t                          max_requests;
-    ngx_msec_t                          time;
-    ngx_msec_t                          timeout;
-    ngx_queue_t                         free;
-    ngx_queue_t                         cache;
-    ngx_http_upstream_init_pt           original_init_upstream;
-    ngx_http_upstream_init_peer_pt      original_init_peer;
-} ngx_http_upstream_ntlm_srv_conf_t;
+typedef enum {
+    NGX_NTLM_INVALID_TOKEN,
+    NGX_NTLM_INITIAL_TOKEN,
+    NGX_NTLM_RESPONSE_TOKEN,
+    NGX_NTLM_CHALLENGE_TOKEN,
+    NGX_NTLM_COMPLETE_TOKEN
+} ngx_http_ntlm_token_t;
 
 typedef struct {
-    ngx_http_upstream_ntlm_srv_conf_t  *conf;
-    ngx_queue_t                         queue;
-    ngx_connection_t                   *peer_connection;
-    ngx_connection_t                   *client_connection;
-    /*
-     * in_cache is the authoritative ownership indicator (invariant I1).
-     * All releases MUST go through ngx_http_upstream_ntlm_item_release().
-     */
-    unsigned                            in_cache:1;
-} ngx_http_upstream_ntlm_cache_t;
+    ngx_uint_t                         max_cached;
+    ngx_uint_t                         max_requests;
+    ngx_msec_t                         time;
+    ngx_msec_t                         timeout;
+    ngx_uint_t                         cached;
+    ngx_queue_t                        cache;
+    ngx_http_upstream_init_peer_pt     original_init_peer;
+    unsigned                          enabled:1;
+} ngx_http_ntlm_conf_t;
 
+/* Allocated in the upstream socket's pool; survives requests, not the socket. */
 typedef struct {
-    ngx_http_upstream_ntlm_srv_conf_t  *conf;
-    ngx_http_upstream_t                *upstream;
-    void                               *data;
-    ngx_connection_t                   *client_connection;
-    unsigned                            cached:1;
-    unsigned                            ntlm_init:1;
-    ngx_event_get_peer_pt               original_get_peer;
-    ngx_event_free_peer_pt              original_free_peer;
-    ngx_event_notify_peer_pt            original_notify;
+    ngx_addr_t                        *peer;
+    ngx_http_ntlm_scheme_t             scheme;
+    unsigned                          pending:1;
+} ngx_http_ntlm_session_t;
+
+/*
+ * Allocated in the client connection's cleanup pool.  An empty handle remains
+ * reusable by that client, but is on the upstream LRU only while owning a socket.
+ * tag separates locations with distinct proxy configurations.
+ */
+typedef struct {
+    ngx_http_ntlm_conf_t               *conf;
+    ngx_http_upstream_conf_t           *tag;
+    ngx_queue_t                        queue;
+    ngx_connection_t                  *connection;
+    ngx_http_ntlm_session_t            *session;
+} ngx_http_ntlm_owner_t;
+
+/* Request-local wrapper; saved callbacks must receive their original data. */
+typedef struct {
+    ngx_http_request_t                 *request;
+    ngx_http_ntlm_conf_t               *conf;
+    ngx_http_ntlm_owner_t              *owner;
+    ngx_http_ntlm_session_t            *session;
+    ngx_http_ntlm_scheme_t              scheme;
+    ngx_http_ntlm_token_t               token;
+    unsigned                           reused:1;
+    void                              *data;
+    ngx_event_get_peer_pt              get;
+    ngx_event_free_peer_pt             free;
+    ngx_event_notify_peer_pt           notify;
 #if (NGX_HTTP_SSL)
-    ngx_event_set_peer_session_pt       original_set_session;
-    ngx_event_save_peer_session_pt      original_save_session;
+    ngx_event_set_peer_session_pt      set_session;
+    ngx_event_save_peer_session_pt     save_session;
 #endif
-} ngx_http_upstream_ntlm_peer_data_t;
+} ngx_http_ntlm_peer_t;
 
-/* ── Module registration ─────────────────────────────────────────────────── */
+static ngx_int_t ngx_http_ntlm_init_peer(ngx_http_request_t *r,
+    ngx_http_upstream_srv_conf_t *us);
+static ngx_int_t ngx_http_ntlm_get_peer(ngx_peer_connection_t *pc, void *data);
+static void ngx_http_ntlm_free_peer(ngx_peer_connection_t *pc, void *data,
+    ngx_uint_t state);
+static void ngx_http_ntlm_notify(ngx_peer_connection_t *pc, void *data,
+    ngx_uint_t type);
+static void ngx_http_ntlm_cleanup(void *data);
+static void ngx_http_ntlm_idle(ngx_event_t *ev);
+static void ngx_http_ntlm_dummy(ngx_event_t *ev);
+static void ngx_http_ntlm_close(ngx_connection_t *c);
+static void *ngx_http_ntlm_create_conf(ngx_conf_t *cf);
+static char *ngx_http_ntlm_init_main_conf(ngx_conf_t *cf, void *conf);
+static char *ngx_http_ntlm_directive(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+#if (NGX_HTTP_SSL)
+static ngx_int_t ngx_http_ntlm_set_session(ngx_peer_connection_t *pc, void *data);
+static void ngx_http_ntlm_save_session(ngx_peer_connection_t *pc, void *data);
+#endif
 
-static ngx_command_t ngx_http_upstream_ntlm_commands[] = {
-
+static ngx_command_t ngx_http_ntlm_commands[] = {
     { ngx_string("ntlm"),
       NGX_HTTP_UPS_CONF|NGX_CONF_NOARGS|NGX_CONF_TAKE1,
-      ngx_http_upstream_ntlm_directive,
-      NGX_HTTP_SRV_CONF_OFFSET,
-      0,
-      NULL },
-
+      ngx_http_ntlm_directive, NGX_HTTP_SRV_CONF_OFFSET, 0, NULL },
     { ngx_string("ntlm_timeout"),
-      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_msec_slot,
-      NGX_HTTP_SRV_CONF_OFFSET,
-      offsetof(ngx_http_upstream_ntlm_srv_conf_t, timeout),
-      NULL },
-
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1, ngx_conf_set_msec_slot,
+      NGX_HTTP_SRV_CONF_OFFSET, offsetof(ngx_http_ntlm_conf_t, timeout), NULL },
     { ngx_string("ntlm_time"),
-      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_msec_slot,
-      NGX_HTTP_SRV_CONF_OFFSET,
-      offsetof(ngx_http_upstream_ntlm_srv_conf_t, time),
-      NULL },
-
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1, ngx_conf_set_msec_slot,
+      NGX_HTTP_SRV_CONF_OFFSET, offsetof(ngx_http_ntlm_conf_t, time), NULL },
     { ngx_string("ntlm_requests"),
-      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_num_slot,
-      NGX_HTTP_SRV_CONF_OFFSET,
-      offsetof(ngx_http_upstream_ntlm_srv_conf_t, max_requests),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1, ngx_conf_set_num_slot,
+      NGX_HTTP_SRV_CONF_OFFSET, offsetof(ngx_http_ntlm_conf_t, max_requests),
       NULL },
-
     ngx_null_command
 };
 
-static ngx_http_module_t ngx_http_upstream_ntlm_ctx = {
-    NULL,                                   /* preconfiguration */
-    NULL,                                   /* postconfiguration */
-    NULL,                                   /* create main configuration */
-    ngx_http_upstream_ntlm_init_main_conf,  /* init main configuration */
-    ngx_http_upstream_ntlm_create_conf,     /* create server configuration */
-    NULL,                                   /* merge server configuration */
-    NULL,                                   /* create location configuration */
-    NULL                                    /* merge location configuration */
+static ngx_http_module_t ngx_http_ntlm_ctx = {
+    NULL, NULL, NULL, ngx_http_ntlm_init_main_conf,
+    ngx_http_ntlm_create_conf, NULL, NULL, NULL
 };
 
 ngx_module_t ngx_http_upstream_ntlm_module = {
     NGX_MODULE_V1,
-    &ngx_http_upstream_ntlm_ctx,
-    ngx_http_upstream_ntlm_commands,
+    &ngx_http_ntlm_ctx,
+    ngx_http_ntlm_commands,
     NGX_HTTP_MODULE,
-    NULL,   /* init master */
-    NULL,   /* init module */
-    NULL,   /* init process */
-    NULL,   /* init thread */
-    NULL,   /* exit thread */
-    NULL,   /* exit process */
-    NULL,   /* exit master */
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     NGX_MODULE_V1_PADDING
 };
 
-/* ── Helper: release a cache item back to the free list ─────────────────── */
-
-/*
- * ngx_http_upstream_ntlm_item_release — single, canonical release path.
- *
- * Atomically clears all three ownership fields (in_cache, peer_connection,
- * client_connection) before touching any queue, satisfying invariant I1.
- * Callers are responsible for closing peer_connection if needed; this
- * function only manages the item's queue state.
- */
-static ngx_inline void
-ngx_http_upstream_ntlm_item_release(ngx_http_upstream_ntlm_cache_t *item)
+static ngx_connection_t *
+ngx_http_ntlm_detach(ngx_http_ntlm_owner_t *owner)
 {
-    item->in_cache = 0;
-    item->peer_connection = NULL;
-    item->client_connection = NULL;
-    ngx_queue_remove(&item->queue);
-    ngx_queue_insert_head(&item->conf->free, &item->queue);
+    ngx_connection_t  *c;
+
+    c = owner->connection;
+    if (c != NULL) {
+        /* Remove idle ownership before handing the socket to core or closing it. */
+        owner->connection = NULL;
+        owner->session = NULL;
+        ngx_queue_remove(&owner->queue);
+        owner->conf->cached--;
+        c->data = NULL;
+    }
+
+    return c;
 }
-
-/* ── Upstream initialisation ─────────────────────────────────────────────── */
-
-static ngx_int_t
-ngx_http_upstream_init_ntlm(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
-{
-    ngx_uint_t                          i;
-    ngx_http_upstream_ntlm_cache_t     *cached;
-    ngx_http_upstream_ntlm_srv_conf_t  *hncf;
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, cf->log, 0, "ntlm init");
-
-    hncf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_ntlm_module);
-
-    ngx_conf_init_uint_value(hncf->max_cached, 100);
-    ngx_conf_init_msec_value(hncf->timeout, 60000);
-    ngx_conf_init_uint_value(hncf->max_requests, 1000);
-    ngx_conf_init_msec_value(hncf->time, 3600000);
-
-    if (hncf->original_init_upstream(cf, us) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-    /*
-     * Do not wrap us->peer.init here.  Wrapping is deferred to
-     * ngx_http_upstream_ntlm_init_main_conf so that the NTLM layer is always
-     * installed after any peer wrappers that other modules inject in their own
-     * init_main_conf hooks (e.g. nginx master's automatic keepalive injection),
-     * keeping NTLM as the outermost wrapper regardless of nginx version.
-     */
-
-    cached = ngx_pcalloc(cf->pool,
-                         sizeof(ngx_http_upstream_ntlm_cache_t)
-                         * hncf->max_cached);
-    if (cached == NULL) {
-        return NGX_ERROR;
-    }
-
-    ngx_queue_init(&hncf->cache);
-    ngx_queue_init(&hncf->free);
-
-    for (i = 0; i < hncf->max_cached; i++) {
-        ngx_queue_insert_head(&hncf->free, &cached[i].queue);
-        cached[i].conf = hncf;
-    }
-
-    return NGX_OK;
-}
-
-/* ── Per-request peer initialisation ────────────────────────────────────── */
-
-static ngx_int_t
-ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
-    ngx_http_upstream_srv_conf_t *us)
-{
-    ngx_http_upstream_ntlm_peer_data_t  *hnpd;
-    ngx_http_upstream_ntlm_srv_conf_t   *hncf;
-    ngx_str_t                            auth;
-
-    hncf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_ntlm_module);
-
-    hnpd = ngx_palloc(r->pool, sizeof(ngx_http_upstream_ntlm_peer_data_t));
-    if (hnpd == NULL) {
-        return NGX_ERROR;
-    }
-
-    if (hncf->original_init_peer(r, us) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-    hnpd->ntlm_init = 0;
-    hnpd->cached    = 0;
-
-    if (r->headers_in.authorization != NULL) {
-        auth = r->headers_in.authorization->value;
-
-        if ((auth.len >= sizeof("NTLM") - 1
-             && ngx_strncasecmp(auth.data, (u_char *) "NTLM",
-                                sizeof("NTLM") - 1) == 0
-             && (auth.len == sizeof("NTLM") - 1
-                 || auth.data[sizeof("NTLM") - 1] == ' '))
-            || (auth.len >= sizeof("Negotiate") - 1
-                && ngx_strncasecmp(auth.data, (u_char *) "Negotiate",
-                                   sizeof("Negotiate") - 1) == 0
-                && (auth.len == sizeof("Negotiate") - 1
-                    || auth.data[sizeof("Negotiate") - 1] == ' ')))
-        {
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "ntlm: authorization header detected");
-            hnpd->ntlm_init = 1;
-        }
-    }
-
-    hnpd->conf              = hncf;
-    hnpd->upstream          = r->upstream;
-    hnpd->data              = r->upstream->peer.data;
-    hnpd->client_connection = r->connection;
-
-    hnpd->original_get_peer  = r->upstream->peer.get;
-    hnpd->original_free_peer = r->upstream->peer.free;
-
-    r->upstream->peer.data = hnpd;
-    r->upstream->peer.get  = ngx_http_upstream_get_ntlm_peer;
-    r->upstream->peer.free = ngx_http_upstream_free_ntlm_peer;
-
-    hnpd->original_notify = NULL;
-    if (r->upstream->peer.notify) {
-        hnpd->original_notify      = r->upstream->peer.notify;
-        r->upstream->peer.notify   = ngx_http_upstream_ntlm_notify_peer;
-    }
-
-#if (NGX_HTTP_SSL)
-    hnpd->original_set_session  = r->upstream->peer.set_session;
-    hnpd->original_save_session = r->upstream->peer.save_session;
-
-    r->upstream->peer.set_session  = ngx_http_upstream_ntlm_set_session;
-    r->upstream->peer.save_session = ngx_http_upstream_ntlm_save_session;
-#endif
-
-    return NGX_OK;
-}
-
-/* ── get peer: select (or reuse) an upstream connection ─────────────────── */
-
-static ngx_int_t
-ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc, void *data)
-{
-    ngx_http_upstream_ntlm_peer_data_t  *hndp = data;
-    ngx_http_upstream_ntlm_cache_t      *item;
-    ngx_int_t                            rc;
-    ngx_queue_t                         *q, *cache;
-    ngx_connection_t                    *c;
-
-    rc = hndp->original_get_peer(pc, hndp->data);
-    if (rc != NGX_OK) {
-        return rc;
-    }
-
-    cache = &hndp->conf->cache;
-
-    for (q = ngx_queue_head(cache);
-         q != ngx_queue_sentinel(cache);
-         q = ngx_queue_next(q))
-    {
-        item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
-
-        if (item->client_connection != hndp->client_connection) {
-            continue;
-        }
-
-        c = item->peer_connection;
-
-        /*
-         * Invariant I4 — stale-credential eviction.
-         *
-         * If new NTLM/Negotiate credentials arrived and the upstream TCP
-         * connection has already completed its handshake (c->requests >= 2),
-         * close the old authenticated session so that the new identity gets a
-         * fresh upstream connection.  The >= 2 threshold preserves the ability
-         * to send the NTLM Type-3 message on the same TCP connection as
-         * Type-1 (c->requests == 1 at that point).
-         */
-        if (hndp->ntlm_init && c->requests >= 2) {
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
-                           "ntlm: new credentials on established session, "
-                           "evicting upstream connection %p (requests=%ui)",
-                           c, c->requests);
-            ngx_http_upstream_ntlm_item_release(item);
-            ngx_http_upstream_ntlm_close(c);
-            break; /* fall through → NGX_OK → fresh upstream connection */
-        }
-
-        /*
-         * Reuse the cached connection.  Release through the canonical helper
-         * so ownership fields and queue movement stay atomic and consistent
-         * (invariant I1).
-         */
-        ngx_http_upstream_ntlm_item_release(item);
-
-        hndp->cached = 1;
-        goto found;
-    }
-
-    return NGX_OK;
-
-found:
-
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
-                   "ntlm: reusing upstream connection %p", c);
-
-    c->idle   = 0;
-    c->sent   = 0;
-
-    /*
-     * Restore c->read->data to the connection pointer (invariant I2).
-     * While cached, c->read->data held the NTLM cache item so that our
-     * close_handler could retrieve it without touching c->data.
-     * nginx upstream core requires ev->data == c, so reset before reuse.
-     */
-    c->read->data = c;
-    c->data       = NULL;
-    c->log        = pc->log;
-    c->read->log  = pc->log;
-    c->write->log = pc->log;
-    c->pool->log  = pc->log;
-
-    if (c->read->timer_set) {
-        ngx_del_timer(c->read);
-    }
-
-    pc->connection = c;
-    pc->cached = 1;
-
-    return NGX_DONE;
-}
-
-/* ── free peer: decide whether to cache the upstream connection ──────────── */
-
-/*
- * Fault-injection for testing the OOM guard (invariant I3).
- * Build nginx with -DNGX_NTLM_TEST_CLEANUP_NULL to make
- * ngx_pool_cleanup_add() always return NULL inside this translation unit,
- * exercising the "not caching upstream connection" error path.
- * See t/001-sanity.t TEST 6 for the corresponding test.
- */
-#ifdef NGX_NTLM_TEST_CLEANUP_NULL
-#  undef  ngx_pool_cleanup_add
-#  define ngx_pool_cleanup_add(pool, size)  NULL
-#endif
 
 static void
-ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc, void *data,
-    ngx_uint_t state)
+ngx_http_ntlm_cleanup(void *data)
 {
-    ngx_http_upstream_ntlm_peer_data_t  *hndp = data;
-    ngx_http_upstream_ntlm_cache_t      *item;
-    ngx_queue_t                         *q;
-    ngx_connection_t                    *c;
-    ngx_http_upstream_t                 *u;
-    ngx_pool_cleanup_t                  *cln;
-    ngx_http_upstream_ntlm_cache_t      *cleanup_item;
+    ngx_connection_t  *c;
 
-    u = hndp->upstream;
-    c = pc->connection;
+    c = ngx_http_ntlm_detach(data);
+    if (c != NULL) {
+        ngx_http_ntlm_close(c);
+    }
+}
 
-    /* Reject connections that cannot safely be reused. */
+static ngx_http_ntlm_owner_t *
+ngx_http_ntlm_find_owner(ngx_http_request_t *r, ngx_http_ntlm_conf_t *conf)
+{
+    ngx_pool_cleanup_t     *cln;
+    ngx_http_ntlm_owner_t  *owner;
 
-    if (state & NGX_PEER_FAILED
-        || c == NULL
-        || c->read->eof
-        || c->read->error
-        || c->read->timedout
-        || c->write->error
-        || c->write->timedout)
+    for (cln = r->connection->pool->cleanup; cln; cln = cln->next) {
+        if (cln->handler != ngx_http_ntlm_cleanup) {
+            continue;
+        }
+        owner = cln->data;
+        if (owner->conf == conf && owner->tag == r->upstream->conf) {
+            return owner;
+        }
+    }
+
+    return NULL;
+}
+
+static ngx_addr_t *
+ngx_http_ntlm_copy_peer(ngx_pool_t *pool, ngx_addr_t *source)
+{
+    ngx_addr_t  *peer;
+
+    peer = ngx_palloc(pool, sizeof(ngx_addr_t) + source->socklen
+                           + source->name.len);
+    if (peer == NULL) {
+        return NULL;
+    }
+    peer->sockaddr = (struct sockaddr *) (peer + 1);
+    peer->socklen = source->socklen;
+    ngx_memcpy(peer->sockaddr, source->sockaddr, source->socklen);
+    peer->name.data = (u_char *) peer->sockaddr + source->socklen;
+    peer->name.len = source->name.len;
+    ngx_memcpy(peer->name.data, source->name.data, source->name.len);
+    return peer;
+}
+
+static ngx_int_t
+ngx_http_ntlm_der(ngx_str_t *input, u_char tag, ngx_str_t *value)
+{
+    u_char  *p, *last;
+    size_t   len, n;
+
+    /* Consume one bounded DER value, leaving any trailing fields in input. */
+    p = input->data;
+    last = p + input->len;
+    if (input->len < 2 || *p++ != tag) {
+        return NGX_ERROR;
+    }
+    len = *p++;
+    if (len & 0x80) {
+        n = len & 0x7f;
+        if (n == 0 || n > sizeof(size_t) || n > (size_t) (last - p)
+            || *p == 0)
+        {
+            return NGX_ERROR;
+        }
+        len = 0;
+        while (n--) {
+            len = (len << 8) | *p++;
+        }
+        if (len < 128) {
+            return NGX_ERROR;
+        }
+    }
+    if (len > (size_t) (last - p)) {
+        return NGX_ERROR;
+    }
+    value->data = p;
+    value->len = len;
+    input->data = p + len;
+    input->len = last - input->data;
+    return NGX_OK;
+}
+
+/*
+ * SPNEGO payloads stay opaque.  Validate only the NegTokenResp envelope and
+ * negotiation state; a leading 0xa1 byte alone is not a continuation token.
+ */
+static ngx_http_ntlm_token_t
+ngx_http_ntlm_spnego(ngx_str_t token, ngx_uint_t challenge)
+{
+    ngx_str_t   sequence, field, value;
+    ngx_uint_t  state, payload, previous, tag;
+    u_char      inner;
+
+    if (ngx_http_ntlm_der(&token, 0xa1, &field) != NGX_OK || token.len
+        || ngx_http_ntlm_der(&field, 0x30, &sequence) != NGX_OK || field.len)
     {
-        goto invalid;
+        return NGX_NTLM_INVALID_TOKEN;
     }
 
-    if (!u->keepalive) {
-        goto invalid;
+    /* SPNEGO states are 0..3; 4 means the optional negState was absent. */
+    state = 4;
+    payload = 0;
+    previous = 0;
+    while (sequence.len) {
+        tag = sequence.data[0];
+        if (tag < 0xa0 || tag > 0xa3 || tag <= previous
+            || ngx_http_ntlm_der(&sequence, (u_char) tag, &field) != NGX_OK)
+        {
+            return NGX_NTLM_INVALID_TOKEN;
+        }
+        /* Fields [0]..[3] must be ordered and occur at most once. */
+        previous = tag;
+        inner = tag == 0xa0 ? 0x0a : tag == 0xa1 ? 0x06 : 0x04;
+        if (ngx_http_ntlm_der(&field, inner, &value) != NGX_OK
+            || field.len || value.len == 0)
+        {
+            return NGX_NTLM_INVALID_TOKEN;
+        }
+        if (tag == 0xa0) {
+            if (value.len != 1 || value.data[0] > 3) {
+                return NGX_NTLM_INVALID_TOKEN;
+            }
+            state = value.data[0];
+        } else if (tag >= 0xa2) {
+            payload = 1;
+        }
     }
 
-    if (!u->request_body_sent) {
-        goto invalid;
+    if (!challenge) {
+        return payload ? NGX_NTLM_RESPONSE_TOKEN : NGX_NTLM_INVALID_TOKEN;
     }
-
-    if (ngx_terminate || ngx_exiting) {
-        goto invalid;
+    if (state == 0 || state == 2) {
+        /* Both accept-completed and reject end continuation eligibility. */
+        return NGX_NTLM_COMPLETE_TOKEN;
     }
+    return state == 1 || state == 3 || payload
+           ? NGX_NTLM_CHALLENGE_TOKEN : NGX_NTLM_INVALID_TOKEN;
+}
 
-    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-        goto invalid;
+static ngx_int_t
+ngx_http_ntlm_decode(ngx_http_request_t *r, ngx_str_t encoded,
+    ngx_http_ntlm_scheme_t scheme, ngx_uint_t challenge)
+{
+    ngx_str_t  token;
+
+    token.data = ngx_pnalloc(r->pool, ngx_base64_decoded_length(encoded.len));
+    if (token.data == NULL) {
+        return NGX_ERROR;
     }
-
-    if (c->requests >= hndp->conf->max_requests) {
-        goto invalid;
+    if (encoded.len == 0 || ngx_decode_base64(&token, &encoded) != NGX_OK) {
+        return NGX_NTLM_INVALID_TOKEN;
     }
-
-    if (ngx_current_msec - c->start_time > hndp->conf->time) {
-        goto invalid;
+    if (token.len >= 12 && ngx_memcmp(token.data, "NTLMSSP\0", 8) == 0) {
+        /* Classify message direction only; the backend validates credentials. */
+        if (token.data[9] || token.data[10] || token.data[11]) {
+            return NGX_NTLM_INVALID_TOKEN;
+        }
+        switch (token.data[8]) {
+        case 1:
+            return challenge ? NGX_NTLM_INVALID_TOKEN : NGX_NTLM_INITIAL_TOKEN;
+        case 2:
+            return challenge ? NGX_NTLM_CHALLENGE_TOKEN : NGX_NTLM_INVALID_TOKEN;
+        case 3:
+            return challenge ? NGX_NTLM_INVALID_TOKEN : NGX_NTLM_RESPONSE_TOKEN;
+        default:
+            return NGX_NTLM_INVALID_TOKEN;
+        }
     }
-
-    /* Only cache connections that were part of an NTLM session. */
-    if (hndp->ntlm_init == 0 && hndp->cached == 0) {
-        goto invalid;
+    if (scheme == NGX_NTLM_NEGOTIATE && token.len) {
+        if (!challenge && token.data[0] == 0x60) {
+            return NGX_NTLM_INITIAL_TOKEN;
+        }
+        return ngx_http_ntlm_spnego(token, challenge);
     }
+    return NGX_NTLM_INVALID_TOKEN;
+}
 
-    /* Acquire a free slot, evicting the oldest entry if the cache is full. */
+static ngx_http_ntlm_scheme_t
+ngx_http_ntlm_scheme(ngx_str_t *value)
+{
+    ngx_str_t  name;
 
-    if (ngx_queue_empty(&hndp->conf->free)) {
-        ngx_connection_t *old_c;
+    name = *value;
+    while (value->len && value->data[0] != ' ' && value->data[0] != '\t') {
+        value->data++;
+        value->len--;
+    }
+    name.len -= value->len;
+    while (value->len && (value->data[0] == ' ' || value->data[0] == '\t')) {
+        value->data++;
+        value->len--;
+    }
+    if (name.len == 4 && ngx_strncasecmp(name.data, (u_char *) "NTLM", 4) == 0) {
+        return NGX_NTLM_AUTH;
+    }
+    if (name.len == 9
+        && ngx_strncasecmp(name.data, (u_char *) "Negotiate", 9) == 0)
+    {
+        return NGX_NTLM_NEGOTIATE;
+    }
+    return NGX_NTLM_OTHER_AUTH;
+}
 
+/*
+ * Return 1 for a matching continuation challenge, 0 for an explicit header
+ * without one, NGX_DECLINED for no authentication headers, or NGX_ERROR on OOM.
+ */
+static ngx_int_t
+ngx_http_ntlm_challenge(ngx_http_ntlm_peer_t *pd)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *header;
+    ngx_str_t        value, entry;
+    ngx_uint_t       i, quoted, seen;
+    ngx_int_t        token;
+    u_char          *p, *start, *last;
+
+    part = &pd->request->upstream->headers_in.headers.part;
+    header = part->elts;
+    seen = 0;
+    for (i = 0; /* void */; i++) {
+        if (i == part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            header = part->elts;
+            i = 0;
+        }
+        if (header[i].key.len != sizeof("WWW-Authenticate") - 1
+            || ngx_strncasecmp(header[i].key.data,
+                               (u_char *) "WWW-Authenticate",
+                               sizeof("WWW-Authenticate") - 1) != 0)
+        {
+            continue;
+        }
+        seen = 1;
+        value = header[i].value;
+        p = value.data;
+        last = p + value.len;
+        while (p < last) {
+            while (p < last && (*p == ',' || *p == ' ' || *p == '\t')) {
+                p++;
+            }
+            start = p;
+            quoted = 0;
+            /* A comma inside a quoted Basic realm is not a challenge separator. */
+            while (p < last) {
+                if (*p == '\\' && quoted && p + 1 < last) {
+                    p += 2;
+                    continue;
+                }
+                if (*p == '"') {
+                    quoted = !quoted;
+                } else if (*p == ',' && !quoted) {
+                    break;
+                }
+                p++;
+            }
+            entry.data = start;
+            entry.len = p - start;
+            if (ngx_http_ntlm_scheme(&entry) != pd->session->scheme) {
+                continue;
+            }
+            while (entry.len && (entry.data[entry.len - 1] == ' '
+                                || entry.data[entry.len - 1] == '\t'))
+            {
+                entry.len--;
+            }
+            token = ngx_http_ntlm_decode(pd->request, entry,
+                                        pd->session->scheme, 1);
+            if (token == NGX_ERROR) {
+                return NGX_ERROR;
+            }
+            return token == NGX_NTLM_CHALLENGE_TOKEN;
+        }
+    }
+    return seen ? 0 : NGX_DECLINED;
+}
+
+static ngx_int_t
+ngx_http_ntlm_init_peer(ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *us)
+{
+    ngx_http_ntlm_peer_t  *pd;
+    ngx_str_t             auth;
+    ngx_int_t             token;
+
+    if (r->http_version >= NGX_HTTP_VERSION_20) {
+        /* A multiplexed client connection cannot identify one NTLM session. */
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "ntlm: HTTP/2 and HTTP/3 requests are not supported");
+        return NGX_ERROR;
+    }
+    pd = ngx_pcalloc(r->pool, sizeof(ngx_http_ntlm_peer_t));
+    if (pd == NULL) {
+        return NGX_ERROR;
+    }
+    pd->request = r;
+    pd->conf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_ntlm_module);
+    if (pd->conf->original_init_peer(r, us) != NGX_OK) {
+        return NGX_ERROR;
+    }
+    pd->owner = ngx_http_ntlm_find_owner(r, pd->conf);
+    if (r->headers_in.authorization) {
+        auth = r->headers_in.authorization->value;
+        pd->scheme = ngx_http_ntlm_scheme(&auth);
+        if (pd->scheme == NGX_NTLM_AUTH || pd->scheme == NGX_NTLM_NEGOTIATE) {
+            token = ngx_http_ntlm_decode(r, auth, pd->scheme, 0);
+            if (token == NGX_ERROR) {
+                return NGX_ERROR;
+            }
+            pd->token = token;
+        }
+    }
+    pd->data = r->upstream->peer.data;
+    pd->get = r->upstream->peer.get;
+    pd->free = r->upstream->peer.free;
+    pd->notify = r->upstream->peer.notify;
+    r->upstream->peer.data = pd;
+    r->upstream->peer.get = ngx_http_ntlm_get_peer;
+    r->upstream->peer.free = ngx_http_ntlm_free_peer;
+    r->upstream->peer.notify = ngx_http_ntlm_notify;
+#if (NGX_HTTP_SSL)
+    pd->set_session = r->upstream->peer.set_session;
+    pd->save_session = r->upstream->peer.save_session;
+    r->upstream->peer.set_session = ngx_http_ntlm_set_session;
+    r->upstream->peer.save_session = ngx_http_ntlm_save_session;
+#endif
+    return NGX_OK;
+}
+
+static ngx_uint_t
+ngx_http_ntlm_expired(ngx_connection_t *c, ngx_http_ntlm_conf_t *conf)
+{
+    /* Check the deadline too: its timer callback may not have run yet. */
+    return c->close || c->read->eof || c->read->error || c->read->timedout
+           || c->write->error || c->write->timedout
+           || c->requests >= conf->max_requests
+           || ngx_current_msec - c->start_time >= conf->time
+           || (c->read->timer_set
+               && (ngx_msec_int_t) (ngx_current_msec - c->read->timer.key) >= 0);
+}
+
+static ngx_int_t
+ngx_http_ntlm_get_peer(ngx_peer_connection_t *pc, void *data)
+{
+    ngx_http_ntlm_peer_t     *pd = data;
+    ngx_connection_t        *c;
+    ngx_http_ntlm_session_t  *session;
+    ngx_addr_t              *peer;
+
+    /* get_peer can run again for a retry; never carry a private-hit lease state. */
+    pd->reused = 0;
+    pd->session = NULL;
+    if (pd->owner && pd->owner->connection) {
+        c = pd->owner->connection;
+        session = pd->owner->session;
         /*
-         * Cache is full.  Evict the oldest (tail) entry through the canonical
-         * release path, then reuse the resulting free slot.
+         * No Authorization header preserves connection-bound identity.  An
+         * explicit header may reuse it only to answer a pending same-scheme
+         * challenge; new initial tokens and other credentials start fresh.
          */
-        q    = ngx_queue_last(&hndp->conf->cache);
-        item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
-
-        old_c = item->peer_connection;
-
-        ngx_http_upstream_ntlm_item_release(item);
-
-        q    = ngx_queue_head(&hndp->conf->free);
-        item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
-        ngx_queue_remove(q);
-
-        if (old_c != NULL) {
-            ngx_http_upstream_ntlm_close(old_c);
-        }
-    } else {
-        q    = ngx_queue_head(&hndp->conf->free);
-        item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
-        ngx_queue_remove(q);
-    }
-
-    ngx_queue_insert_head(&hndp->conf->cache, q);
-
-    item->peer_connection   = c;
-    item->client_connection = hndp->client_connection;
-    item->in_cache          = 1;
-
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
-                   "ntlm: caching upstream connection %p for client %p",
-                   c, item->client_connection);
-
-    /*
-     * Invariant I3 — OOM guard.
-     *
-     * Register a cleanup handler on the client connection pool so that the
-     * upstream connection is closed when the client disconnects.  If the pool
-     * allocator fails, undo the cache insertion: without a cleanup handler the
-     * item would hold a client_connection pointer that nginx may recycle for a
-     * different client, enabling a session-hijack via pointer reuse (ABA).
-     *
-     * If the client connection already has a handler from a previous request,
-     * update its data pointer to the current item instead of registering a
-     * second handler.
-     */
-    cleanup_item = NULL;
-    for (cln = item->client_connection->pool->cleanup;
-         cln != NULL;
-         cln = cln->next)
-    {
-        if (cln->handler == ngx_http_upstream_client_conn_cleanup) {
-            cln->data    = item;
-            cleanup_item = item;
-            break;
+        if (ngx_http_ntlm_expired(c, pd->conf)
+            || (pd->scheme != NGX_NTLM_NO_AUTH
+                && (pd->token != NGX_NTLM_RESPONSE_TOKEN || !session->pending
+                    || pd->scheme != session->scheme)))
+        {
+            ngx_http_ntlm_cleanup(pd->owner);
+        } else {
+            /* Logging must outlive a socket closed or evicted in free_peer. */
+            peer = ngx_http_ntlm_copy_peer(pd->request->pool, session->peer);
+            if (peer == NULL) {
+                return NGX_ERROR;
+            }
+            pd->session = session;
+            pd->reused = 1;
+            ngx_http_ntlm_detach(pd->owner);
+            c->idle = 0;
+            c->sent = 0;
+            c->log = pc->log;
+            c->read->log = pc->log;
+            c->write->log = pc->log;
+            c->pool->log = pc->log;
+            if (c->read->timer_set) {
+                ngx_del_timer(c->read);
+            }
+            pc->sockaddr = peer->sockaddr;
+            pc->socklen = peer->socklen;
+            pc->name = &peer->name;
+            pc->connection = c;
+            pc->cached = 1;
+            return NGX_DONE;
         }
     }
+    /* Only a miss asks the balancer/shared keepalive layer for another peer. */
+    return pd->get(pc, pd->data);
+}
 
-    if (cleanup_item == NULL) {
-        cln = ngx_pool_cleanup_add(item->client_connection->pool, 0);
+static ngx_int_t
+ngx_http_ntlm_cache(ngx_http_ntlm_peer_t *pd, ngx_peer_connection_t *pc)
+{
+    ngx_http_request_t     *r = pd->request;
+    ngx_connection_t       *c = pc->connection;
+    ngx_pool_cleanup_t     *cln;
+    ngx_http_ntlm_owner_t  *old;
+    ngx_addr_t             peer;
+    ngx_int_t              pending;
+
+    if (pd->owner == NULL) {
+        /* Another subrequest may have registered the handle since init_peer. */
+        pd->owner = ngx_http_ntlm_find_owner(r, pd->conf);
+    }
+    if (pd->owner == NULL) {
+#ifdef NGX_NTLM_TEST_CLEANUP_NULL
+        cln = NULL;
+#else
+        /* Register disconnect cleanup before publishing any idle ownership. */
+        cln = ngx_pool_cleanup_add(r->connection->pool,
+                                  sizeof(ngx_http_ntlm_owner_t));
+#endif
         if (cln == NULL) {
             ngx_log_error(NGX_LOG_ERR, pc->log, 0,
-                          "ntlm: failed to allocate cleanup handler,"
-                          " not caching upstream connection");
-            /*
-             * Undo the cache insertion (invariant I3): clear all ownership
-             * fields and return the slot to the free list.
-             */
-            ngx_http_upstream_ntlm_item_release(item);
-            goto invalid;
+                          "ntlm: failed to allocate cleanup handler");
+            return NGX_ERROR;
         }
-        cln->handler = ngx_http_upstream_client_conn_cleanup;
-        cln->data    = item;
+        pd->owner = cln->data;
+        ngx_memzero(pd->owner, sizeof(ngx_http_ntlm_owner_t));
+        pd->owner->conf = pd->conf;
+        pd->owner->tag = r->upstream->conf;
+        cln->handler = ngx_http_ntlm_cleanup;
+    }
+    if (pd->session == NULL) {
+        /* Copy peer metadata out of the selecting request/balancer's storage. */
+        pd->session = ngx_pcalloc(c->pool, sizeof(ngx_http_ntlm_session_t));
+        if (pd->session == NULL) {
+            return NGX_ERROR;
+        }
+        peer.sockaddr = pc->sockaddr;
+        peer.socklen = pc->socklen;
+        peer.name = *pc->name;
+        pd->session->peer = ngx_http_ntlm_copy_peer(c->pool, &peer);
+        if (pd->session->peer == NULL) {
+            return NGX_ERROR;
+        }
+        pd->session->scheme = pd->scheme;
+    }
+    pending = ngx_http_ntlm_challenge(pd);
+    if (pending == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+    /*
+     * An unauthenticated intermediate request with no challenge leaves the
+     * exchange pending.  Explicit credentials or an authentication response
+     * replace that state; HTTP status alone never determines completion.
+     */
+    if (pending != NGX_DECLINED || pd->scheme != NGX_NTLM_NO_AUTH) {
+        pd->session->pending = pending == 1;
     }
 
-    pc->connection    = NULL;
-    c->read->delayed  = 0;
+    /* Concurrent subrequests can finish with another idle socket already held. */
+    ngx_http_ntlm_cleanup(pd->owner);
+    if (pd->conf->cached == pd->conf->max_cached) {
+        old = ngx_queue_data(ngx_queue_last(&pd->conf->cache),
+                             ngx_http_ntlm_owner_t, queue);
+        ngx_http_ntlm_cleanup(old);
+    }
+    pd->owner->connection = c;
+    pd->owner->session = pd->session;
+    ngx_queue_insert_head(&pd->conf->cache, &pd->owner->queue);
+    pd->conf->cached++;
 
-    ngx_add_timer(c->read, hndp->conf->timeout);
-
+    /*
+     * Transfer the socket from upstream core to the idle owner.  Keep event
+     * data pointing to c; only c->data changes meaning under our idle handlers.
+     * Cycle logging must replace request logging before the request pool dies.
+     */
+    pc->connection = NULL;
+    c->data = pd->owner;
+    c->idle = 1;
+    c->read->delayed = 0;
+    c->read->handler = ngx_http_ntlm_idle;
+    c->write->handler = ngx_http_ntlm_dummy;
+    c->log = ngx_cycle->log;
+    c->read->log = ngx_cycle->log;
+    c->write->log = ngx_cycle->log;
+    c->pool->log = ngx_cycle->log;
+    ngx_add_timer(c->read, pd->conf->timeout);
     if (c->write->timer_set) {
         ngx_del_timer(c->write);
     }
-
-    c->write->handler = ngx_http_upstream_ntlm_dummy_handler;
-    c->read->handler  = ngx_http_upstream_ntlm_close_handler;
-
-    /*
-     * Invariant I2 — store the cache item in c->read->data, not c->data.
-     *
-     * nginx's ngx_http_upstream_handler() requires c->data to be the request
-     * pointer; overwriting it with a cache item pointer causes a segfault on
-     * nginx >= 1.25 if any posted or ready event reaches that handler while
-     * the connection is idle.  Because we have replaced c->read->handler with
-     * our own close_handler, only our handler runs on read events; it
-     * retrieves the item via ev->data (== c->read->data) without touching
-     * c->data.  c->read->data is restored to c when the connection is handed
-     * back to upstream core (see ngx_http_upstream_get_ntlm_peer).
-     */
-    c->read->data = item;
-    c->data       = NULL;
-    c->idle       = 1;
-    c->log        = ngx_cycle->log;
-    c->read->log  = ngx_cycle->log;
-    c->write->log = ngx_cycle->log;
-    c->pool->log  = ngx_cycle->log;
-
     if (c->read->ready) {
-        ngx_http_upstream_ntlm_close_handler(c->read);
+        ngx_http_ntlm_idle(c->read);
     }
-
-    /*
-     * Call original_free_peer to release round-robin (and any other lower
-     * layer) accounting — e.g. decrementing the round-robin peer's conns
-     * counter.  pc->connection is already NULL so keepalive's free_peer
-     * (if present) will skip its own caching and delegate to round-robin.
-     */
-invalid:
-    hndp->original_free_peer(pc, hndp->data, state);
-    return;
-}
-
-/* ── Client-connection pool cleanup handler ─────────────────────────────── */
-
-/*
- * Called when the client connection's pool is destroyed (i.e. the client
- * disconnects).  Closes the bound upstream connection synchronously so that
- * the item is immediately returned to the free list.  Must NOT post an event:
- * a posted event fires asynchronously and by that time the upstream connection
- * may have been claimed for a new request, causing a double-close or queue
- * corruption.
- */
-static void
-ngx_http_upstream_client_conn_cleanup(void *data)
-{
-    ngx_http_upstream_ntlm_cache_t  *item = data;
-    ngx_connection_t                *c;
-
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                   "ntlm: client connection closed %p, dropping upstream %p",
-                   item->client_connection, item->peer_connection);
-
-    /*
-     * Guard against double-execution (invariant I1).  in_cache == 0 means
-     * the connection was already consumed by get_ntlm_peer or closed by
-     * the close_handler / an eviction.  Nothing to do.
-     */
-    if (!item->in_cache) {
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                       "ntlm: upstream already released for client %p/%p",
-                       item->client_connection, item->peer_connection);
-        return;
-    }
-
-    c = item->peer_connection;
-
-    /* Release the item atomically (invariant I1) before any queue or I/O. */
-    ngx_http_upstream_ntlm_item_release(item);
-
-    if (c == NULL) {
-        return;
-    }
-
-    if (c->read->timer_set) {
-        ngx_del_timer(c->read);
-    }
-
-    ngx_http_upstream_ntlm_close(c);
-}
-
-/* ── Idle-connection event handlers ─────────────────────────────────────── */
-
-static void
-ngx_http_upstream_ntlm_dummy_handler(ngx_event_t *ev)
-{
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ev->log, 0, "ntlm: dummy handler");
+    return NGX_OK;
 }
 
 static void
-ngx_http_upstream_ntlm_notify_peer(ngx_peer_connection_t *pc, void *data,
-    ngx_uint_t type)
+ngx_http_ntlm_free_peer(ngx_peer_connection_t *pc, void *data, ngx_uint_t state)
 {
-    ngx_http_upstream_ntlm_peer_data_t  *hndp = data;
+    ngx_http_ntlm_peer_t  *pd = data;
+    ngx_http_upstream_t   *u = pd->request->upstream;
+    ngx_connection_t     *c = pc->connection;
+    ngx_uint_t            private;
 
-    if (hndp->original_notify) {
-        hndp->original_notify(pc, hndp->data, type);
-    }
-}
-
-/*
- * ngx_http_upstream_ntlm_close_handler — fires on read activity or timeout
- * for an idle cached upstream connection.
- *
- * ev->data holds the owning cache item (invariant I2: stored in c->read->data,
- * not c->data).  We close the upstream TCP connection and return the slot to
- * the free list.
- */
-static void
-ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev)
-{
-    ngx_http_upstream_ntlm_cache_t  *item;
-    ngx_connection_t                *c;
-    int                              n;
-    char                             buf[1];
-
-    /*
-     * Retrieve the cache item from the read-event's data field (invariant I2).
-     * c->data is not touched; nginx core expects it to hold the request pointer.
-     */
-    item = ev->data;
-
-    if (item == NULL || !item->in_cache) {
-        /* Already released by cleanup or eviction. */
-        return;
-    }
-
-    c = item->peer_connection;
-
-    if (c == NULL) {
-        /* Ownership was cleared by a concurrent path. */
-        return;
-    }
-
-    if (c->close || c->read->timedout) {
-        goto close;
-    }
-
-    n = recv(c->fd, buf, 1, MSG_PEEK);
-
-    if (n == -1 && ngx_socket_errno == NGX_EAGAIN) {
-        /* Spurious wake-up: upstream is still idle. */
-        ev->ready = 0;
-
-        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-            goto close;
+    private = pd->reused || pd->scheme == NGX_NTLM_AUTH
+              || pd->scheme == NGX_NTLM_NEGOTIATE;
+    /* Retry-rejected sockets must not be cached and immediately selected again. */
+    if (private && c && !(state & (NGX_PEER_FAILED|NGX_PEER_NEXT))
+        && !ngx_http_ntlm_expired(c, pd->conf)
+        && u->keepalive && u->request_body_sent && !ngx_terminate && !ngx_exiting
+        && ngx_handle_read_event(c->read, 0) == NGX_OK)
+    {
+        if (ngx_http_ntlm_cache(pd, pc) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, pc->log, 0,
+                          "ntlm: cannot retain private session, closing socket");
         }
-
+    }
+    if (pd->reused) {
+        /* No peer selection occurred, so there is no balancer lease to free. */
+        if (pc->tries) {
+            pc->tries--;
+        }
         return;
     }
-
-    /* n == 0 (EOF), n > 0 (unexpected data), or a real error. */
-
-close:
-
-    /*
-     * Double-check ownership before closing (belt-and-suspenders for I1).
-     * A concurrent cleanup or eviction may have cleared in_cache since the
-     * checks above.
-     */
-    if (!item->in_cache || item->peer_connection != c) {
-        return;
+    c = pc->connection;
+    if (private) {
+        /* Release balancer accounting without exposing NTLM to shared caching. */
+        pc->connection = NULL;
     }
-
-    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, ev->log, 0,
-                   "ntlm: closing idle upstream %p (timedout=%u, recv=%i)",
-                   c, c->read->timedout, n);
-
-    /* Release atomically (invariant I1) before any queue or I/O. */
-    ngx_http_upstream_ntlm_item_release(item);
-
-    ngx_http_upstream_ntlm_close(c);
+    pd->free(pc, pd->data, state);
+    if (private) {
+        /* Core must close rejected private sockets, never share them. */
+        pc->connection = c;
+    }
 }
 
-/* ── Connection teardown ─────────────────────────────────────────────────── */
+static void
+ngx_http_ntlm_notify(ngx_peer_connection_t *pc, void *data, ngx_uint_t type)
+{
+    ngx_http_ntlm_peer_t  *pd = data;
+
+    if (!pd->reused && pd->notify) {
+        pd->notify(pc, pd->data, type);
+    }
+}
 
 static void
-ngx_http_upstream_ntlm_close(ngx_connection_t *c)
+ngx_http_ntlm_dummy(ngx_event_t *ev)
 {
+}
+
+static void
+ngx_http_ntlm_idle(ngx_event_t *ev)
+{
+    ngx_connection_t      *c = ev->data;
+    ngx_http_ntlm_owner_t *owner = c->data;
+    ssize_t                n;
+    char                   buf;
+
+    if (c->close || ev->timedout) {
+        ngx_http_ntlm_cleanup(owner);
+        return;
+    }
+    n = recv(c->fd, &buf, 1, MSG_PEEK);
+    if (n == -1 && ngx_socket_errno == NGX_EAGAIN) {
+        ev->ready = 0;
+        if (ngx_handle_read_event(ev, 0) == NGX_OK) {
+            return;
+        }
+    }
+    /* EOF, unsolicited bytes, or a socket error make an idle peer unsafe. */
+    ngx_http_ntlm_cleanup(owner);
+}
+
+static void
+ngx_http_ntlm_close(ngx_connection_t *c)
+{
+    c->data = NULL;
+    c->idle = 0;
+    c->log = ngx_cycle->log;
+    c->read->log = ngx_cycle->log;
+    c->write->log = ngx_cycle->log;
+    c->pool->log = ngx_cycle->log;
 #if (NGX_HTTP_SSL)
     if (c->ssl) {
         c->ssl->no_wait_shutdown = 1;
         c->ssl->no_send_shutdown = 1;
-
         if (ngx_ssl_shutdown(c) == NGX_AGAIN) {
-            c->ssl->handler = ngx_http_upstream_ntlm_close;
+            /* SSL handlers now own events; resume teardown after they finish. */
+            c->ssl->handler = ngx_http_ntlm_close;
             return;
         }
     }
 #endif
-
-    if (c->pool) {
-        ngx_destroy_pool(c->pool);
-        c->pool = NULL;
-    }
+    ngx_destroy_pool(c->pool);
+    c->pool = NULL;
     ngx_close_connection(c);
 }
 
-/* ── SSL session pass-through ────────────────────────────────────────────── */
-
 #if (NGX_HTTP_SSL)
-
 static ngx_int_t
-ngx_http_upstream_ntlm_set_session(ngx_peer_connection_t *pc, void *data)
+ngx_http_ntlm_set_session(ngx_peer_connection_t *pc, void *data)
 {
-    ngx_http_upstream_ntlm_peer_data_t  *hndp = data;
+    ngx_http_ntlm_peer_t  *pd = data;
 
-    return hndp->original_set_session(pc, hndp->data);
+    /* Cached sockets already completed TLS; callbacks apply to new handshakes. */
+    if (!pc->connection || pc->cached || !pd->set_session) {
+        return NGX_OK;
+    }
+    return pd->set_session(pc, pd->data);
 }
 
 static void
-ngx_http_upstream_ntlm_save_session(ngx_peer_connection_t *pc, void *data)
+ngx_http_ntlm_save_session(ngx_peer_connection_t *pc, void *data)
 {
-    ngx_http_upstream_ntlm_peer_data_t  *hndp = data;
+    ngx_http_ntlm_peer_t  *pd = data;
 
-    hndp->original_save_session(pc, hndp->data);
+    if (pc->connection && !pc->cached && pd->save_session) {
+        pd->save_session(pc, pd->data);
+    }
 }
-
 #endif
 
-/* ── Configuration ───────────────────────────────────────────────────────── */
-
-/*
- * ngx_http_upstream_ntlm_init_main_conf — install the NTLM peer wrapper.
- *
- * Runs during nginx's init_main_conf phase, which executes all HTTP module
- * init_main_conf hooks in ascending module-index order.  Built-in modules
- * (including ngx_http_upstream_keepalive_module) have lower indices than
- * --add-module extensions, so this hook always runs AFTER the keepalive
- * module has had a chance to inject its own peer wrapper.
- *
- * nginx master introduced automatic keepalive injection in keepalive's
- * init_main_conf.  If NTLM wrapped peer.init during init_upstream (as it did
- * before this fix), the keepalive wrapper would sit on the outside, stealing
- * connections before NTLM could pin them and breaking NTLM session stickiness.
- * Moving the wrapping here guarantees NTLM is always the outermost layer.
- */
 static char *
-ngx_http_upstream_ntlm_init_main_conf(ngx_conf_t *cf, void *conf)
+ngx_http_ntlm_init_main_conf(ngx_conf_t *cf, void *data)
 {
-    ngx_uint_t                           i;
-    ngx_http_upstream_main_conf_t       *umcf;
-    ngx_http_upstream_srv_conf_t       **uscfp;
-    ngx_http_upstream_ntlm_srv_conf_t   *hncf;
+    ngx_http_upstream_main_conf_t  *umcf;
+    ngx_http_upstream_srv_conf_t  **us;
+    ngx_http_ntlm_conf_t           *conf;
+    ngx_uint_t                     i;
 
-    umcf  = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_module);
-    uscfp = umcf->upstreams.elts;
-
+    /* Install outside built-in keepalive, including automatic injection. */
+    umcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_module);
+    us = umcf->upstreams.elts;
     for (i = 0; i < umcf->upstreams.nelts; i++) {
-
-        /* skip implicit upstreams (no server-conf block) */
-        if (uscfp[i]->srv_conf == NULL) {
+        if (us[i]->srv_conf == NULL) {
             continue;
         }
-
-        hncf = ngx_http_conf_upstream_srv_conf(uscfp[i],
+        conf = ngx_http_conf_upstream_srv_conf(us[i],
                                                ngx_http_upstream_ntlm_module);
-
-        /* skip upstreams that don't have the ntlm directive */
-        if (hncf->original_init_upstream == NULL) {
+        if (!conf->enabled) {
             continue;
         }
-
-        /*
-         * At this point uscfp[i]->peer.init points to whatever the last
-         * init_main_conf hook installed (round-robin, keepalive wrapper, etc.).
-         * Save it as our original and replace it with the NTLM wrapper.
-         */
-        hncf->original_init_peer = uscfp[i]->peer.init;
-        uscfp[i]->peer.init      = ngx_http_upstream_init_ntlm_peer;
+        ngx_conf_init_uint_value(conf->max_cached, 100);
+        ngx_conf_init_uint_value(conf->max_requests, 1000);
+        ngx_conf_init_msec_value(conf->timeout, 60000);
+        ngx_conf_init_msec_value(conf->time, 3600000);
+        ngx_queue_init(&conf->cache);
+        conf->original_init_peer = us[i]->peer.init;
+        us[i]->peer.init = ngx_http_ntlm_init_peer;
     }
-
     return NGX_CONF_OK;
 }
 
-
 static void *
-ngx_http_upstream_ntlm_create_conf(ngx_conf_t *cf)
+ngx_http_ntlm_create_conf(ngx_conf_t *cf)
 {
-    ngx_http_upstream_ntlm_srv_conf_t  *conf;
+    ngx_http_ntlm_conf_t  *conf;
 
-    conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_ntlm_srv_conf_t));
+    conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_ntlm_conf_t));
     if (conf == NULL) {
         return NULL;
     }
-
-    conf->max_cached  = NGX_CONF_UNSET_UINT;
+    conf->max_cached = NGX_CONF_UNSET_UINT;
     conf->max_requests = NGX_CONF_UNSET_UINT;
-    conf->time        = NGX_CONF_UNSET_MSEC;
-    conf->timeout     = NGX_CONF_UNSET_MSEC;
-
+    conf->timeout = NGX_CONF_UNSET_MSEC;
+    conf->time = NGX_CONF_UNSET_MSEC;
     return conf;
 }
 
 static char *
-ngx_http_upstream_ntlm_directive(ngx_conf_t *cf, ngx_command_t *cmd,
-    void *conf)
+ngx_http_ntlm_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *data)
 {
-    ngx_http_upstream_srv_conf_t       *uscf;
-    ngx_http_upstream_ntlm_srv_conf_t  *hncf = conf;
-    ngx_str_t                          *value;
-    ngx_int_t                           n;
+    ngx_http_ntlm_conf_t          *conf = data;
+    ngx_str_t                    *value;
+    ngx_int_t                     n;
 
+    if (conf->enabled) {
+        return "is duplicate";
+    }
     if (cf->args->nelts == 2) {
         value = cf->args->elts;
         n = ngx_atoi(value[1].data, value[1].len);
@@ -897,16 +844,9 @@ ngx_http_upstream_ntlm_directive(ngx_conf_t *cf, ngx_command_t *cmd,
                                &value[1], &cmd->name);
             return NGX_CONF_ERROR;
         }
-        hncf->max_cached = (ngx_uint_t) n;
+        conf->max_cached = n;
     }
-
-    uscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
-
-    hncf->original_init_upstream = uscf->peer.init_upstream
-                                   ? uscf->peer.init_upstream
-                                   : ngx_http_upstream_init_round_robin;
-
-    uscf->peer.init_upstream = ngx_http_upstream_init_ntlm;
-
+    /* Defer wrapping until all balancing and keepalive initializers have run. */
+    conf->enabled = 1;
     return NGX_CONF_OK;
 }
