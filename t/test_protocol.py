@@ -1,8 +1,11 @@
 import asyncio
 import base64
+import concurrent.futures
 import http.client
+import json
 import os
 from pathlib import Path
+import select
 import shutil
 import socket
 import ssl
@@ -11,7 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import spnego
@@ -33,6 +36,14 @@ class NTLMHandler(BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.context = None
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            with self.server.changed:
+                self.server.authenticated.discard(self.connection)
+                self.server.changed.notify_all()
 
     def do_GET(self):
         self.server.requests.append(self.path)
@@ -100,15 +111,49 @@ class NTLMHandler(BaseHTTPRequestHandler):
                 challenge = "Negotiate " + base64.b64encode(
                     b"\xa1\x0a\x30\x08\xa0\x03\x0a\x01\x01\xff\xff\xff"
                 ).decode()
+        complete = bool(self.context and self.context.complete)
+        if complete:
+            with self.server.changed:
+                self.server.authenticated.add(self.connection)
+                self.server.changed.notify_all()
+        body = b"OK"
+        name = self.path.rsplit("/", 1)[-1]
+        if self.path.startswith("/auth/parallel/") and name in self.server.parallel:
+            action = self.server.parallel_actions.get(name)
+            if action == "retry":
+                status = 403
+            record = {
+                "name": name,
+                "status": status,
+                "connection": self.client_address[1],
+                "backend": self.server.server_address[1],
+                "authenticated": complete,
+                "principal": self.context.client_principal if complete else None,
+                "challenge": challenge,
+                "action": action,
+            }
+            with self.server.changed:
+                self.server.parallel_records.append(record)
+                self.server.parallel_sockets[name] = self.connection
+                self.server.changed.notify_all()
+            arrived, release = self.server.parallel[name]
+            arrived.set()
+            if not release.wait(timeout=8):
+                self.send_error(504)
+                return
+            if action in ("drop", "abort"):
+                self.close_connection = True
+                return
+            body = (json.dumps(record) + "\n").encode()
         self.send_response(status)
-        self.send_header("Content-Length", "2")
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Connection-ID", str(self.client_address[1]))
         if challenge:
             if self.headers.get("X-Audit-Challenge-Layout") == "separate":
                 self.send_header("WWW-Authenticate", 'Basic realm="audit"')
             self.send_header("WWW-Authenticate", challenge)
         self.end_headers()
-        self.wfile.write(b"OK")
+        self.wfile.write(body)
 
     def log_message(self, *args):
         pass
@@ -168,7 +213,7 @@ async def connect_h3(port, configuration):
         transport.close()
 
 
-class ProtocolTests(unittest.TestCase):
+class ProtocolTestCase(unittest.TestCase):
     def setUp(self):
         previous = os.environ.get("NTLM_USER_FILE")
         self.addCleanup(self.restore_credentials, previous)
@@ -180,7 +225,9 @@ class ProtocolTests(unittest.TestCase):
         else:
             os.environ["NTLM_USER_FILE"] = previous
 
-    def start(self, shared=True, server_options="", upstream_tls=None):
+    def start(self, shared=True, server_options="", upstream_tls=None,
+              backend_count=1, extra_http_config="", extra_server_config="",
+              proxy_options="", debug=False):
         nginx = shutil.which(os.environ.get("TEST_NGINX_BINARY", "nginx"))
         self.assertIsNotNone(nginx, "build nginx with TLS, HTTP/2 and HTTP/3 first")
         directory = tempfile.TemporaryDirectory(prefix="ntlm-protocol-")
@@ -189,9 +236,20 @@ class ProtocolTests(unittest.TestCase):
         credentials = prefix / "users"
         credentials.write_text(f"AUDIT:test:{PASSWORD}\n", encoding="ascii")
         os.environ["NTLM_USER_FILE"] = str(credentials)
-        backend = ThreadingHTTPServer(("127.0.0.1", 0), NTLMHandler)
-        backend.daemon_threads = True
-        backend.messages, backend.errors, backend.requests, backend.challenges = [], [], [], []
+        backends = [
+            ThreadingHTTPServer(("127.0.0.1", 0), NTLMHandler)
+            for _ in range(backend_count)
+        ]
+        backend = backends[0]
+        backend.peers = backends
+        backend.changed = threading.Condition()
+        backend.authenticated = set()
+        backend.parallel = {
+            name: (threading.Event(), threading.Event())
+            for name in ("first", "second")
+        }
+        backend.parallel_records = []
+        backend.parallel_sockets = {}
         cert, key = prefix / "cert.pem", prefix / "key.pem"
         subprocess.run(
             ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
@@ -203,12 +261,24 @@ class ProtocolTests(unittest.TestCase):
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.minimum_version = context.maximum_version = upstream_tls
             context.load_cert_chain(cert, key)
-            backend.socket = context.wrap_socket(backend.socket, server_side=True)
-        thread = threading.Thread(target=backend.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(thread.join)
-        self.addCleanup(backend.server_close)
-        self.addCleanup(backend.shutdown)
+        for peer in backends:
+            peer.daemon_threads = True
+            peer.messages, peer.errors, peer.requests, peer.challenges = [], [], [], []
+            peer.changed = backend.changed
+            peer.authenticated = backend.authenticated
+            peer.parallel = backend.parallel
+            peer.parallel_records = backend.parallel_records
+            peer.parallel_sockets = backend.parallel_sockets
+            peer.parallel_actions = {}
+            if upstream_tls:
+                peer.socket = context.wrap_socket(peer.socket, server_side=True)
+            thread = threading.Thread(target=peer.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(thread.join)
+            self.addCleanup(peer.server_close)
+            self.addCleanup(peer.shutdown)
+        for _, release in backend.parallel.values():
+            self.addCleanup(release.set)
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
@@ -221,19 +291,25 @@ class ProtocolTests(unittest.TestCase):
         scheme = "https" if upstream_tls else "http"
         config = prefix / "nginx.conf"
         error_log = prefix / "error.log"
+        servers = "\n".join(
+            f"server 127.0.0.1:{peer.server_address[1]} "
+            f"{server_options if index == 0 else 'backup'};"
+            for index, peer in enumerate(backends)
+        )
         config.write_text(
             f"""
 {f'load_module {os.environ["TEST_NGINX_MODULE"]};' if os.environ.get("TEST_NGINX_MODULE") else ""}
 daemon off;
 master_process off;
 pid {prefix}/nginx.pid;
-error_log {error_log} info;
+error_log {error_log} {"debug" if debug else "info"};
 events {{ worker_connections 256; }}
 http {{
     access_log off;
+    {extra_http_config}
     upstream backend {{
         zone protocol_peers 64k;
-        server 127.0.0.1:{backend.server_address[1]} {server_options};
+        {servers}
         {options}
         ntlm 16;
     }}
@@ -246,6 +322,7 @@ http {{
         ssl_protocols TLSv1.3;
         location /auth {{ proxy_pass {scheme}://backend; }}
         location /plain {{ return 200 "OK"; }}
+        {extra_server_config}
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_ssl_session_reuse on;
@@ -253,6 +330,7 @@ http {{
         proxy_ssl_trusted_certificate {cert};
         proxy_ssl_name localhost;
         proxy_ssl_server_name on;
+        {proxy_options}
     }}
 }}
 """, encoding="ascii")
@@ -316,6 +394,8 @@ http {{
         )
         return authenticated
 
+
+class ProtocolTests(ProtocolTestCase):
     def test_challenge_first_and_preemptive_ntlm_keep_the_handshake_socket(self):
         for shared, challenge_first in [(False, True), (True, False), (True, True), (None, True)]:
             with self.subTest(shared=shared, challenge_first=challenge_first):
@@ -567,6 +647,7 @@ http {{
         asyncio.run(exercise())
         self.assertIn("requests are not supported", error_log.read_text())
 
+
     def test_http2_rejects_ntlm_without_disabling_other_streams(self):
         backend, port, _, _, error_log = self.start()
 
@@ -606,3 +687,264 @@ http {{
                 self.assertEqual(status, expected)
         self.assertFalse(backend.requests)
         self.assertIn("requests are not supported", error_log.read_text())
+
+
+class ParallelProtocolTests(ProtocolTestCase):
+    def start_parallel(self, **options):
+        return self.start(
+            debug=True,
+            extra_http_config="""
+                log_format parallel '$uri $upstream_status $upstream_addr';
+            """,
+            extra_server_config="""
+                log_subrequest on;
+                access_log parallel-access.log parallel;
+                location = /parallel {
+                    default_type text/html;
+                    ssi on;
+                    return 200 '<!--# include virtual="/auth/parallel/first" wait="no" --><!--# include virtual="/auth/parallel/second" wait="no" -->';
+                }
+            """,
+            **options,
+        )
+
+    def wait_until(self, predicate, message):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail(message)
+
+    @staticmethod
+    def reset_parallel(backend):
+        backend.parallel_records.clear()
+        backend.parallel_sockets.clear()
+        for arrived, release in backend.parallel.values():
+            arrived.clear()
+            release.clear()
+
+    def wait_for_overlap(self, backend):
+        for arrived, _ in backend.parallel.values():
+            self.assertTrue(arrived.wait(timeout=3), "subrequests did not overlap")
+        first, second = backend.parallel_records
+        self.assertNotEqual(first["connection"], second["connection"])
+
+    @contextmanager
+    def parallel_request(self, owner, backend, error_log, headers=None):
+        self.reset_parallel(backend)
+        offset = error_log.stat().st_size
+
+        def fetch():
+            owner.request("GET", "/parallel", headers=headers or {})
+            response = owner.getresponse()
+            return response.status, response.read()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fetch)
+            try:
+                self.wait_for_overlap(backend)
+                yield future, offset
+            finally:
+                for _, release in backend.parallel.values():
+                    release.set()
+
+    def finish_first(self, backend, error_log, name, offset, rc=0):
+        backend.parallel[name][1].set()
+        # Core logs this after upstream free_peer; SSI access logging can wait
+        # for the other subrequest's output and cannot establish this ordering.
+        marker = f'http finalize request: {rc}, "/auth/parallel/{name}?'
+        self.wait_until(
+            lambda: marker in error_log.read_text()[offset:],
+            f"{name} did not finalize while the other response was held",
+        )
+
+    def response_records(self, future):
+        status, body = future.result(timeout=3)
+        self.assertEqual(status, 200)
+        records = [json.loads(line) for line in body.splitlines()]
+        self.assertEqual([record["name"] for record in records], ["first", "second"])
+        return records
+
+    def assert_recovery(self, backend, port, owner):
+        self.assertEqual(self.request(owner)[0], 401)
+        self.handshake(owner)
+        self.assertEqual(self.request(owner)[0], 200)
+        self.assertEqual(self.request(self.client(port))[0], 401)
+        self.assertFalse(any(peer.errors for peer in backend.peers))
+
+    def test_authenticated_parallel_requests_preserve_only_the_pinned_identity(self):
+        for finishes_first in ("first", "second"):
+            with self.subTest(finishes_first=finishes_first):
+                backend, port, _, _, log = self.start_parallel()
+                owner = self.client(port)
+                authenticated = self.handshake(owner)
+                with self.parallel_request(owner, backend, log) as (future, offset):
+                    self.finish_first(backend, log, finishes_first, offset)
+                first, second = self.response_records(future)
+                self.assertEqual(first["status"], 200)
+                self.assertTrue(first["authenticated"])
+                self.assertEqual(first["principal"], USERNAME)
+                self.assertEqual(
+                    str(first["connection"]), authenticated["X-Connection-ID"]
+                )
+                self.assertEqual(second["status"], 401)
+                self.assertFalse(second["authenticated"])
+                self.assertIsNone(second["principal"])
+                status, followup = self.request(owner)
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    followup["X-Connection-ID"], authenticated["X-Connection-ID"]
+                )
+                self.assertEqual(self.request(self.client(port))[0], 401)
+                self.assertFalse(backend.errors)
+
+    def test_parallel_real_handshakes_cannot_retain_both_challenge_sockets(self):
+        for retained, finishes_first in (
+            ("first", "first"), ("first", "second"),
+            ("second", "first"), ("second", "second"),
+        ):
+            with self.subTest(retained=retained, finishes_first=finishes_first):
+                backend, port, _, _, log = self.start_parallel()
+                owner = self.client(port)
+                context = spnego.client(USERNAME, PASSWORD, protocol="ntlm")
+                headers = {
+                    "Authorization": "NTLM " + base64.b64encode(context.step()).decode()
+                }
+                challenge_finishes_first = "second" if retained == "first" else "first"
+                with self.parallel_request(
+                    owner, backend, log, headers
+                ) as (future, offset):
+                    self.finish_first(backend, log, challenge_finishes_first, offset)
+                challenges = self.response_records(future)
+                for record in challenges:
+                    self.assertEqual(record["status"], 401)
+                    self.assertFalse(record["authenticated"])
+                # Both subrequests inherit the real downstream Authorization.
+                # Continue the first challenge, whether or not its socket won.
+                token = context.step(
+                    base64.b64decode(challenges[0]["challenge"].split(" ", 1)[1])
+                )
+                headers["Authorization"] = "NTLM " + base64.b64encode(token).decode()
+
+                with self.parallel_request(
+                    owner, backend, log, headers
+                ) as (future, offset):
+                    self.finish_first(backend, log, finishes_first, offset)
+                completed = self.response_records(future)
+                # The first continuation takes the sole retained socket even
+                # when its Type 3 belongs to the other, discarded challenge.
+                self.assertEqual(
+                    completed[0]["connection"],
+                    next(r["connection"] for r in challenges if r["name"] == retained),
+                )
+                expected = [200, 401] if retained == "first" else [401, 401]
+                self.assertEqual([r["status"] for r in completed], expected)
+                self.assertEqual(
+                    [r["authenticated"] for r in completed],
+                    [retained == "first", False],
+                )
+                self.assertEqual(len(backend.errors), 1 if retained == "first" else 2)
+                self.assertEqual([kind for kind, _ in backend.messages], [1, 1, 3, 3])
+                # A failed continuation that finishes last can also replace a
+                # concurrently authenticated socket with its unauthenticated one.
+                status, followup = self.request(owner)
+                survives = retained == "first" and finishes_first == "second"
+                self.assertEqual(status, 200 if survives else 401)
+                if survives:
+                    self.assertEqual(
+                        followup["X-Connection-ID"], str(completed[0]["connection"])
+                    )
+                self.handshake(owner)
+                self.assertEqual(self.request(owner)[0], 200)
+                self.assertEqual(self.request(self.client(port))[0], 401)
+
+    def test_client_abort_closes_active_authenticated_upstream(self):
+        backend, port, _, _, log = self.start_parallel()
+        owner = self.client(port)
+        self.handshake(owner)
+        backend.parallel_actions.update(first="abort", second="abort")
+        self.reset_parallel(backend)
+        try:
+            owner.request("GET", "/parallel")
+            self.wait_for_overlap(backend)
+            sockets = list(backend.parallel_sockets.values())
+            self.assertEqual(sum(r["authenticated"] for r in backend.parallel_records), 1)
+            owner.sock.shutdown(socket.SHUT_RDWR)
+            owner.close()
+
+            def disconnected(connection):
+                if not select.select([connection], [], [], 0)[0]:
+                    return False
+                try:
+                    return connection.recv(1, socket.MSG_PEEK) == b""
+                except ConnectionResetError:
+                    return True
+
+            self.wait_until(
+                lambda: all(disconnected(connection) for connection in sockets),
+                "nginx kept an active upstream open after downstream abort",
+            )
+        finally:
+            for _, release in backend.parallel.values():
+                release.set()
+        with backend.changed:
+            self.assertTrue(
+                backend.changed.wait_for(lambda: not backend.authenticated, timeout=3),
+                "authenticated socket survived client abort",
+            )
+        self.assert_recovery(backend, port, self.client(port))
+
+    def exercise_upstream_failure(self, action, retry):
+        backend, port, _, _, log = self.start_parallel(
+            backend_count=2 if retry else 1,
+            server_options="max_conns=1" if retry else "",
+            proxy_options=(
+                "proxy_next_upstream error timeout http_403; "
+                "proxy_next_upstream_tries 2;"
+                if retry else "proxy_next_upstream off;"
+            ),
+        )
+        owner = self.client(port)
+        self.handshake(owner)
+        backend.parallel_actions["first"] = action
+        with self.parallel_request(owner, backend, log) as (future, offset):
+            self.finish_first(backend, log, "first", offset, rc=0 if retry else 502)
+        status, _ = future.result(timeout=3)
+        self.assertEqual(status, 200)
+        attempts = [r for r in backend.parallel_records if r["name"] == "first"]
+        self.assertTrue(attempts[0]["authenticated"])
+        self.assertEqual(attempts[0]["action"], action)
+        self.assertEqual(len(attempts), 2 if retry else 1)
+        if retry:
+            self.assertEqual(attempts[1]["backend"], backend.peers[1].server_address[1])
+            self.assertEqual(attempts[1]["status"], 401)
+            self.assertFalse(attempts[1]["authenticated"])
+        other = [r for r in backend.parallel_records if r["name"] == "second"]
+        self.assertEqual(len(other), 1)
+        self.assertEqual(other[0]["status"], 401)
+        self.assertFalse(other[0]["authenticated"])
+        access_log = log.parent / "parallel-access.log"
+        expected = (
+            f"/auth/parallel/first {'403' if action == 'retry' else '502'}, 401 "
+            if retry else "/auth/parallel/first 502 "
+        )
+        self.wait_until(
+            lambda: expected in access_log.read_text(),
+            "unexpected upstream retry/status chain",
+        )
+        with backend.changed:
+            self.assertTrue(
+                backend.changed.wait_for(lambda: not backend.authenticated, timeout=3),
+                "failed authenticated socket was retained",
+            )
+        self.assert_recovery(backend, port, owner)
+
+    def test_backend_disconnect_without_retry_requires_reauthentication(self):
+        self.exercise_upstream_failure("drop", retry=False)
+
+    def test_backend_disconnect_retries_on_an_unauthenticated_backup(self):
+        self.exercise_upstream_failure("drop", retry=True)
+
+    def test_next_upstream_403_rejects_the_authenticated_socket_before_retry(self):
+        self.exercise_upstream_failure("retry", retry=True)

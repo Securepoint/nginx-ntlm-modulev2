@@ -1,3 +1,4 @@
+import concurrent.futures
 import http.client
 import os
 from pathlib import Path
@@ -21,6 +22,11 @@ class Backend(ThreadingHTTPServer):
         self.changed = threading.Condition()
         self.holding = threading.Event()
         self.release = threading.Event()
+        self.parallel = {
+            name: (threading.Event(), threading.Event())
+            for name in ("first", "second")
+        }
+        self.parallel_requests = {}
 
 
 class BackendHandler(BaseHTTPRequestHandler):
@@ -38,6 +44,15 @@ class BackendHandler(BaseHTTPRequestHandler):
                 self.server.authenticated.setdefault(self.connection, auth)
                 self.server.changed.notify_all()
             token = self.server.authenticated.get(self.connection)
+
+        name = self.path.rsplit("/", 1)[-1]
+        if self.path.startswith("/a/parallel/") and name in self.server.parallel:
+            arrived, release = self.server.parallel[name]
+            self.server.parallel_requests[name] = (self.client_address[1], token)
+            arrived.set()
+            if not release.wait(timeout=5):
+                self.send_error(504)
+                return
 
         if token and self.path.endswith("/drop"):
             self.close_connection = True
@@ -81,6 +96,8 @@ class OwnershipTestCase(unittest.TestCase):
     proxy_options = ""
     ntlm_first = False
     max_cached = 1
+    extra_server_config = ""
+    error_log_level = "info"
 
     def setUp(self):
         nginx = shutil.which(os.environ.get(self.nginx_environment, "nginx"))
@@ -112,6 +129,8 @@ class OwnershipTestCase(unittest.TestCase):
             self.addCleanup(backend.server_close)
             self.addCleanup(backend.shutdown)
             self.addCleanup(backend.release.set)
+            for _, release in backend.parallel.values():
+                self.addCleanup(release.set)
             self.backends.append(backend)
         self.backend = self.backends[0]
         self.error_log = prefix / "error.log"
@@ -134,7 +153,7 @@ class OwnershipTestCase(unittest.TestCase):
 daemon off;
 master_process off;
 pid {prefix}/nginx.pid;
-error_log {self.error_log} info;
+error_log {self.error_log} {self.error_log_level};
 events {{ worker_connections 128; {self.event_options} }}
 http {{
     access_log off;
@@ -156,6 +175,7 @@ http {{
         proxy_set_header Connection "";
         add_header X-Upstream $upstream_addr always;
         {self.proxy_options}
+        {self.extra_server_config}
     }}
 }}
 """,
@@ -419,6 +439,96 @@ class BusyBalancerTests(OwnershipTestCase):
             self.assertEqual(response.status, 200)
             response.read()
         self.assertIsNone(self.request(self.client(), "/a"))
+
+
+class ParallelSubrequestTests(OwnershipTestCase):
+    """Exercise socket ownership with auth markers, not NTLM verification."""
+
+    upstream_options = "keepalive 16;"
+    error_log_level = "debug"
+    extra_server_config = """
+        location = /parallel {
+            default_type text/html;
+            ssi on;
+            return 200 '<!--# include virtual="/a/parallel/first" wait="no" --><!--# include virtual="/a/parallel/second" wait="no" -->';
+        }
+    """
+
+    def exercise_parallel(self, authorization, finishes_first="first"):
+        owner = self.client()
+        self.request(owner, "/a", "alpha")
+        owner.request("GET", "/a")
+        initial = owner.getresponse()
+        initial.read()
+        initial_id = int(initial.getheader("X-NGX-CONNECTION-ID"))
+        headers = {"Authorization": "NTLM beta"} if authorization else {}
+
+        def fetch():
+            owner.request("GET", "/parallel", headers=headers)
+            response = owner.getresponse()
+            return response.status, response.read()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fetch)
+            try:
+                for arrived, _ in self.backend.parallel.values():
+                    self.assertTrue(arrived.wait(timeout=2), "subrequests did not overlap")
+                first = self.backend.parallel_requests["first"]
+                second = self.backend.parallel_requests["second"]
+                self.assertNotEqual(first[0], second[0])
+                self.backend.parallel[finishes_first][1].set()
+                # Upstream free_peer runs before this core trace. Access logging
+                # is too late: SSI can postpone it until earlier output is ready.
+                marker = f'http finalize request: 0, "/a/parallel/{finishes_first}?'
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if marker in self.error_log.read_text():
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("subrequest did not finalize before other release")
+            finally:
+                for _, release in self.backend.parallel.values():
+                    release.set()
+            self.assertEqual(future.result(timeout=3), (200, b"OKOK"))
+
+        owner.request("GET", "/a")
+        final = owner.getresponse()
+        self.assertEqual(final.status, 200)
+        final.read()
+        return initial_id, first, second, (
+            int(final.getheader("X-NGX-CONNECTION-ID")),
+            final.getheader("X-NGX-NTLM-AUTH"),
+        )
+
+    def test_anonymous_parallel_subrequest_does_not_replace_pinned_socket(self):
+        initial, first, second, final = self.exercise_parallel(False)
+        self.assertEqual(first, (initial, "NTLM alpha"))
+        self.assertIsNone(second[1])
+        self.assertEqual(final, first)
+
+    def test_parallel_explicit_credentials_keep_the_last_completed_socket(self):
+        initial, first, second, final = self.exercise_parallel(True)
+        self.assertNotEqual(first[0], initial)
+        self.assertEqual(first[1], "NTLM beta")
+        self.assertEqual(second[1], "NTLM beta")
+        self.assertEqual(final, second)
+
+    def test_anonymous_socket_finishing_first_does_not_replace_pinned_socket(self):
+        initial, first, second, final = self.exercise_parallel(
+            False, finishes_first="second"
+        )
+        self.assertEqual(first, (initial, "NTLM alpha"))
+        self.assertIsNone(second[1])
+        self.assertEqual(final, first)
+
+    def test_reversing_completion_reverses_the_retained_explicit_auth_socket(self):
+        _, first, second, final = self.exercise_parallel(
+            True, finishes_first="second"
+        )
+        self.assertEqual(first[1], "NTLM beta")
+        self.assertEqual(second[1], "NTLM beta")
+        self.assertEqual(final, first)
 
 
 class TLSLifecycleTests(OwnershipTestCase):
