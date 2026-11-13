@@ -2,7 +2,7 @@
 
 The NTLM module allows proxying requests with [NTLM Authentication](https://en.wikipedia.org/wiki/Integrated_Windows_Authentication). The upstream connection is bound to the client connection once the client sends a request with the "Authorization" header field value starting with "Negotiate" or "NTLM". Further client requests will be proxied through the same upstream connection, keeping the authentication context.
 
-This module targets **nginx ≥ 1.25**, retaining the original
+This module targets **nginx ≥ 1.26.3**, retaining the original
 [nginx-ntlm-module](https://github.com/Securepoint/nginx-ntlm-module) directives.
 The session lifecycle has been redesigned from `main`, independently of the
 `fix/ntlm-session-ownership` commit history.
@@ -382,8 +382,8 @@ the Python suite. CI covers nginx 1.26.3, 1.30.0 and master.
 
 | nginx version | Notes |
 |---------------|-------|
-| < 1.25        | Not supported. |
-| ≥ 1.25        | Supported. Idle handling uses native nginx event-data ownership. |
+| < 1.26.3      | Not supported. |
+| ≥ 1.26.3      | Supported. Idle handling uses native nginx event-data ownership. |
 | master (1.31+) | Supported. See [nginx master compatibility](#nginx-master-compatibility) below. |
 
 ## nginx master compatibility
@@ -422,7 +422,7 @@ nginx version.
 ## Changelog
 
 ### v2
-- Full rewrite targeting nginx ≥ 1.25
+- Full rewrite targeting nginx ≥ 1.26.3
 - Fix session hijack via cleanup-OOM (Critical)
 - Fix stale-credential reuse (High)
 - Use native nginx event-data ownership during idle caching and TLS teardown

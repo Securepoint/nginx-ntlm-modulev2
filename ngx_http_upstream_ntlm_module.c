@@ -1,5 +1,5 @@
 /*
- * Connection-bound NTLM/Negotiate upstream sessions for nginx >= 1.25.
+ * Connection-bound NTLM/Negotiate upstream sessions for nginx >= 1.26.3.
  *
  * A client-pool cleanup owns each idle session directly.  The upstream LRU
  * only bounds idle capacity; it never supplies reusable ownership records.
